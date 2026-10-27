@@ -1,0 +1,152 @@
+/*
+ * UAE - The Un*x Amiga Emulator
+ *
+ * MC68000 emulation
+ *
+ * Copyright 1995 Bernd Schmidt
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+#ifndef SPCFLAGS_H
+#define SPCFLAGS_H
+
+typedef uae_u32 spcflags_t;
+
+enum {
+	SPCFLAG_STOP				= 0x01,
+	SPCFLAG_INT					= 0x02,
+	SPCFLAG_BRK					= 0x04,
+	SPCFLAG_TRACE				= 0x08,
+	SPCFLAG_DOTRACE				= 0x10,
+	SPCFLAG_DOINT				= 0x20,
+#if USE_JIT
+	SPCFLAG_JIT_END_COMPILE		= 0x40,
+	SPCFLAG_JIT_EXEC_RETURN		= 0x80,
+#else
+	SPCFLAG_JIT_END_COMPILE		= 0,
+	SPCFLAG_JIT_EXEC_RETURN		= 0,
+#endif
+	
+	SPCFLAG_ALL					= SPCFLAG_STOP
+								| SPCFLAG_INT
+								| SPCFLAG_BRK
+								| SPCFLAG_TRACE
+								| SPCFLAG_DOTRACE
+								| SPCFLAG_DOINT
+								| SPCFLAG_JIT_END_COMPILE
+								| SPCFLAG_JIT_EXEC_RETURN
+								,
+	
+	SPCFLAG_ALL_BUT_EXEC_RETURN	= SPCFLAG_ALL & ~SPCFLAG_JIT_EXEC_RETURN
+};
+
+// Flags that should break the inner dispatch loop quickly on ESP32.
+// Include DOINT so interrupt-driven I/O completion is serviced with low latency.
+#define SPCFLAG_URGENT_MASK (SPCFLAG_STOP | SPCFLAG_BRK | SPCFLAG_TRACE | SPCFLAG_DOTRACE | SPCFLAG_DOINT | SPCFLAG_JIT_END_COMPILE)
+
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+/* Hot-path read in the CPU loop.
+ * On ESP32-P4, aligned 32-bit loads are atomic; use a direct read to keep
+ * the instruction dispatch path as lean as possible. */
+#define SPCFLAGS_TEST(m) \
+	((regs.spcflags & (m)) != 0)
+#else
+#define SPCFLAGS_TEST(m) \
+	((regs.spcflags & (m)) != 0)
+#endif
+
+/* Macro only used in m68k_reset() */
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+#define SPCFLAGS_INIT(m) do { \
+	regs.spcflags = (m); \
+	spcflags_urgent = ((m) & SPCFLAG_URGENT_MASK); \
+} while (0)
+#else
+#define SPCFLAGS_INIT(m) do { \
+	regs.spcflags = (m); \
+} while (0)
+#endif
+
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+
+extern volatile spcflags_t spcflags_urgent;
+
+/*
+ * ESP32 dual-core atomic operations using GCC builtins
+ * Required for thread-safety when 60Hz timer runs on different core than CPU emulation
+ */
+#define HAVE_HARDWARE_LOCKS
+
+#define SPCFLAGS_SET(m) do { \
+	const spcflags_t __m = (m); \
+	__atomic_or_fetch(&regs.spcflags, __m, __ATOMIC_RELAXED); \
+	if (__m & SPCFLAG_URGENT_MASK) { \
+		__atomic_or_fetch(&spcflags_urgent, (__m & SPCFLAG_URGENT_MASK), __ATOMIC_RELAXED); \
+	} \
+} while (0)
+
+#define SPCFLAGS_CLEAR(m) do { \
+	const spcflags_t __m = (m); \
+	__atomic_and_fetch(&regs.spcflags, ~__m, __ATOMIC_RELAXED); \
+	if (__m & SPCFLAG_URGENT_MASK) { \
+		__atomic_and_fetch(&spcflags_urgent, ~(__m & SPCFLAG_URGENT_MASK), __ATOMIC_RELAXED); \
+	} \
+} while (0)
+
+#elif !(ENABLE_EXCLUSIVE_SPCFLAGS)
+
+#define SPCFLAGS_SET(m) do { \
+	regs.spcflags |= (m); \
+} while (0)
+
+#define SPCFLAGS_CLEAR(m) do { \
+	regs.spcflags &= ~(m); \
+} while (0)
+
+#elif defined(X86_ASSEMBLY)
+
+#define HAVE_HARDWARE_LOCKS
+
+#define SPCFLAGS_SET(m) do { \
+	__asm__ __volatile__("lock\n\torl %1,%0" : "=m" (regs.spcflags) : "i" ((m))); \
+} while (0)
+
+#define SPCFLAGS_CLEAR(m) do { \
+	__asm__ __volatile__("lock\n\tandl %1,%0" : "=m" (regs.spcflags) : "i" (~(m))); \
+} while (0)
+
+#else
+
+#undef HAVE_HARDWARE_LOCKS
+
+#include "main.h"
+extern B2_mutex *spcflags_lock;
+
+#define SPCFLAGS_SET(m) do { 				\
+	B2_lock_mutex(spcflags_lock);			\
+	regs.spcflags |= (m);					\
+	B2_unlock_mutex(spcflags_lock);		\
+} while (0)
+
+#define SPCFLAGS_CLEAR(m) do {				\
+	B2_lock_mutex(spcflags_lock);			\
+	regs.spcflags &= ~(m);					\
+	B2_unlock_mutex(spcflags_lock);		\
+} while (0)
+
+#endif
+
+#endif /* SPCFLAGS_H */

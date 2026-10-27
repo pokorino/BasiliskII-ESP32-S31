@@ -1,0 +1,2395 @@
+/*
+ * UAE - The Un*x Amiga Emulator
+ *
+ * MC68000 emulation
+ *
+ * (c) 1995 Bernd Schmidt
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "sysdeps.h"
+
+// ESP32 PSRAM support for large data structures and IRAM placement
+#ifdef ARDUINO
+#include <esp_heap_caps.h>
+#include <esp_attr.h>  // For IRAM_ATTR, DRAM_ATTR
+#endif
+
+#include "cpu_emulation.h"
+#include "main.h"
+#include "emul_op.h"
+#include "quickdraw_accel.h"
+
+extern int intlev(void);	// From baisilisk_glue.cpp
+
+#include "m68k.h"
+#include "memory.h"
+#include "readcpu.h"
+#include "newcpu.h"
+#include "compiler/compemu.h"
+#include "fpu/fpu.h"
+
+#if USE_RV32_JIT
+#include "jit_compiler.h"
+#endif
+
+#if defined(ENABLE_EXCLUSIVE_SPCFLAGS) && !defined(HAVE_HARDWARE_LOCKS)
+B2_mutex *spcflags_lock = NULL;
+#endif
+
+bool quit_program = false;
+extern bool boot_control_pending;
+extern void cpu_do_check_control(void);
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+volatile spcflags_t spcflags_urgent = 0;
+#endif
+SDATA_ATTR("cpu_regflags") struct flag_struct regflags;
+
+/* Opcode of faulting instruction */
+uae_u16 last_op_for_exception_3;
+/* PC at fault time */
+uaecptr last_addr_for_exception_3;
+/* Address that generated the exception */
+uaecptr last_fault_for_exception_3;
+
+DRAM_ATTR int areg_byteinc[] = { 1,1,1,1,1,1,1,2 };
+DRAM_ATTR int imm8_table[] = { 8,1,2,3,4,5,6,7 };
+
+// Pre-computed MOVEM decode tables, consulted once per transferred register.
+// Kept in internal RAM: in flash .rodata each lookup can wait on the flash cache.
+// movem_index1: for each byte mask, find the lowest set bit index (0-7)
+DRAM_ATTR const int movem_index1[256] = {
+    0,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    5,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    6,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    5,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    7,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    5,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    6,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    5,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+    4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0,
+};
+
+// movem_index2: 7 - movem_index1
+DRAM_ATTR const int movem_index2[256] = {
+    7,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    3,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    2,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    3,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    1,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    3,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    2,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    3,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    0,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    3,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    2,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    3,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    1,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    3,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    2,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+    3,7,6,7,5,7,6,7,4,7,6,7,5,7,6,7,
+};
+
+// movem_next: i & (~(1 << j)) where j is the lowest set bit
+DRAM_ATTR const int movem_next[256] = {
+    0,0,0,2,0,4,4,6,0,8,8,10,8,12,12,14,
+    0,16,16,18,16,20,20,22,16,24,24,26,24,28,28,30,
+    0,32,32,34,32,36,36,38,32,40,40,42,40,44,44,46,
+    32,48,48,50,48,52,52,54,48,56,56,58,56,60,60,62,
+    0,64,64,66,64,68,68,70,64,72,72,74,72,76,76,78,
+    64,80,80,82,80,84,84,86,80,88,88,90,88,92,92,94,
+    64,96,96,98,96,100,100,102,96,104,104,106,104,108,108,110,
+    96,112,112,114,112,116,116,118,112,120,120,122,120,124,124,126,
+    0,128,128,130,128,132,132,134,128,136,136,138,136,140,140,142,
+    128,144,144,146,144,148,148,150,144,152,152,154,152,156,156,158,
+    128,160,160,162,160,164,164,166,160,168,168,170,168,172,172,174,
+    160,176,176,178,176,180,180,182,176,184,184,186,184,188,188,190,
+    128,192,192,194,192,196,196,198,192,200,200,202,200,204,204,206,
+    192,208,208,210,208,212,212,214,208,216,216,218,216,220,220,222,
+    192,224,224,226,224,228,228,230,224,232,232,234,232,236,236,238,
+    224,240,240,242,240,244,244,246,240,248,248,250,248,252,252,254,
+};
+
+// 256KB opcode lookup table - dynamically allocated
+cpuop_func **cpufunctbl = NULL;
+bool cpufunctbl_in_spiram = false;
+
+#ifndef CPU_COMPACT_DISPATCH
+#define CPU_COMPACT_DISPATCH 1
+#endif
+
+#ifndef CPU_DEFER_DOINT_IN_BATCH
+#define CPU_DEFER_DOINT_IN_BATCH 0
+#endif
+
+#ifndef CPU_TRACE_CACHE
+#define CPU_TRACE_CACHE 0
+#endif
+
+#ifndef CPU_TRAP_PROFILE
+#define CPU_TRAP_PROFILE 0
+#endif
+
+#ifndef CPU_NATIVE_IS_LAYER
+#define CPU_NATIVE_IS_LAYER 0
+#endif
+
+#ifndef CPU_NATIVE_TRAP_DISPATCH
+#define CPU_NATIVE_TRAP_DISPATCH 1
+#endif
+#ifndef CPU_NATIVE_QD_ACCEL
+#define CPU_NATIVE_QD_ACCEL 0
+#endif
+
+
+#if CPU_TRAP_PROFILE
+// One counter per low 12-bit A-line selector. Only the emulator CPU writes;
+// automation reads a slightly fuzzy snapshot, which is sufficient for ranking
+// traps without locks in this diagnostic build.
+DRAM_ATTR static volatile uint32 trap_profile_counts[4096] = {};
+DRAM_ATTR static volatile uint32 layer_selector_counts[256] = {};
+#endif
+
+void CPUTrapProfileReset(void)
+{
+#if CPU_TRAP_PROFILE
+    memset((void *)trap_profile_counts, 0, sizeof(trap_profile_counts));
+    memset((void *)layer_selector_counts, 0, sizeof(layer_selector_counts));
+#endif
+}
+
+uint32 CPUTrapProfileReadLayer(uint8 selector)
+{
+#if CPU_TRAP_PROFILE
+    return layer_selector_counts[selector];
+#else
+    (void)selector;
+    return 0;
+#endif
+}
+
+uint32 CPUTrapProfileRead(uint16 trap_index)
+{
+#if CPU_TRAP_PROFILE
+    return trap_profile_counts[trap_index & 0x0fff];
+#else
+    (void)trap_index;
+    return 0;
+#endif
+}
+
+#if CPU_COMPACT_DISPATCH
+static uae_u16 *compact_dispatch_index = NULL;        // 65536 opcode -> handler ID
+static cpuop_func **compact_dispatch_handlers = NULL; // handler ID -> function pointer
+static uae_u16 compact_dispatch_handler_count = 0;
+
+bool ReserveCompactDispatchIndex(void)
+{
+	if (compact_dispatch_index != NULL) {
+		return true;
+	}
+#ifdef ARDUINO
+	compact_dispatch_index = (uae_u16 *)heap_caps_malloc(
+		65536 * sizeof(uae_u16), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#else
+	compact_dispatch_index = (uae_u16 *)malloc(65536 * sizeof(uae_u16));
+#endif
+	if (compact_dispatch_index == NULL) {
+		write_log("Flat compact dispatch: early 128KB opcode-index reservation failed\n");
+		return false;
+	}
+	write_log("Flat compact dispatch: reserved 128KB opcode index in internal SRAM\n");
+	return true;
+}
+
+static void free_compact_dispatch(void)
+{
+#ifdef ARDUINO
+	if (compact_dispatch_index != NULL) heap_caps_free(compact_dispatch_index);
+	if (compact_dispatch_handlers != NULL) heap_caps_free(compact_dispatch_handlers);
+#else
+	free(compact_dispatch_index);
+	free(compact_dispatch_handlers);
+#endif
+	compact_dispatch_index = NULL;
+	compact_dispatch_handlers = NULL;
+	compact_dispatch_handler_count = 0;
+}
+
+/*
+ * Build an exact flat compact dispatch format. The 128 KiB index is reserved
+ * before subsystem initialization fragments internal SRAM; only the small
+ * unique-handler array is allocated here after the full table is populated.
+ */
+static bool build_compact_dispatch(void)
+{
+#ifdef ARDUINO
+	if (!cpufunctbl_in_spiram || cpufunctbl == NULL) {
+		return false;
+	}
+
+	if (compact_dispatch_index != NULL && compact_dispatch_handlers != NULL) {
+		return true;
+	}
+
+	if (!ReserveCompactDispatchIndex()) {
+		return false;
+	}
+
+	const size_t opcode_count = 65536;
+	const size_t hash_size = 16384; // power-of-two
+	const size_t hash_mask = hash_size - 1;
+
+	struct hash_entry {
+		uintptr_t key;
+		uae_u16 idx;
+	};
+
+	hash_entry *hash_tbl = (hash_entry *)heap_caps_malloc(
+		hash_size * sizeof(hash_entry),
+		MALLOC_CAP_SPIRAM
+	);
+	if (hash_tbl == NULL) {
+		write_log("Flat compact dispatch: failed to allocate temporary hash table\n");
+		return false;
+	}
+	memset(hash_tbl, 0, hash_size * sizeof(hash_entry));
+
+	cpuop_func **tmp_handlers = (cpuop_func **)heap_caps_malloc(
+		opcode_count * sizeof(cpuop_func *),
+		MALLOC_CAP_SPIRAM
+	);
+	if (tmp_handlers == NULL) {
+		heap_caps_free(hash_tbl);
+		write_log("Flat compact dispatch: failed to allocate temporary handler list\n");
+		return false;
+	}
+
+	uae_u16 unique_count = 0;
+	for (size_t opcode = 0; opcode < opcode_count; ++opcode) {
+		uintptr_t key = (uintptr_t)cpufunctbl[opcode];
+		size_t slot = ((key >> 4) ^ (key >> 16)) & hash_mask;
+		size_t probes = 0;
+
+		for (;;) {
+			hash_entry *entry = &hash_tbl[slot];
+				if (entry->key == 0) {
+					if (unique_count == 0xFFFF) {
+						heap_caps_free(tmp_handlers);
+						heap_caps_free(hash_tbl);
+						write_log("Flat compact dispatch: too many unique handlers (%u)\n", unique_count);
+						return false;
+					}
+					entry->key = key;
+					entry->idx = unique_count;
+					tmp_handlers[unique_count] = cpufunctbl[opcode];
+					compact_dispatch_index[opcode] = unique_count;
+					unique_count++;
+					break;
+				}
+				if (entry->key == key) {
+					compact_dispatch_index[opcode] = entry->idx;
+					break;
+			}
+			slot = (slot + 1) & hash_mask;
+			probes++;
+				if (probes >= hash_size) {
+					heap_caps_free(tmp_handlers);
+					heap_caps_free(hash_tbl);
+					write_log("Flat compact dispatch: hash table overflow (%u unique handlers)\n", unique_count);
+					return false;
+				}
+			}
+		}
+
+	const size_t handlers_bytes = (size_t)unique_count * sizeof(cpuop_func *);
+	compact_dispatch_handlers = (cpuop_func **)heap_caps_malloc(
+		handlers_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	if (compact_dispatch_handlers == NULL) {
+		heap_caps_free(tmp_handlers);
+		heap_caps_free(hash_tbl);
+		write_log("Flat compact dispatch: %u-byte handler table allocation failed\n",
+		          (unsigned)handlers_bytes);
+		return false;
+	}
+	memcpy(compact_dispatch_handlers, tmp_handlers, handlers_bytes);
+	heap_caps_free(tmp_handlers);
+	heap_caps_free(hash_tbl);
+	compact_dispatch_handler_count = unique_count;
+
+	write_log("Flat compact dispatch enabled: %u handlers, %u internal bytes total\n",
+	          compact_dispatch_handler_count,
+	          (unsigned)(65536 * sizeof(uae_u16) + handlers_bytes));
+	return true;
+#else
+	return false;
+#endif
+}
+#endif
+
+#if CPU_TRACE_CACHE
+// A data-only threaded trace cache: unlike native JIT code this needs no
+// executable writes, so it works with the P4 bootloader's locked W^X policy.
+// One entry replaces eight guest opcode reads and eight PSRAM table lookups
+// with internal-SRAM loads. The expected-PC chain safely exits when a branch
+// takes a path different from the one recorded.
+#define CPU_TRACE_LENGTH 8
+#define CPU_TRACE_SLOTS 128
+
+struct cpu_trace_item {
+	cpuop_func *handler;
+	uaecptr expected_next_pc;
+	uae_u16 opcode;
+	uae_u16 reserved;
+};
+
+struct cpu_trace_entry {
+	uaecptr start_pc;
+	uae_u8 count;
+	uae_u8 reserved[3];
+	cpu_trace_item items[CPU_TRACE_LENGTH];
+};
+
+DRAM_ATTR static cpu_trace_entry cpu_trace_cache[CPU_TRACE_SLOTS];
+
+void FlushCPUTraceCache(void)
+{
+	memset(cpu_trace_cache, 0, sizeof(cpu_trace_cache));
+}
+
+static inline cpu_trace_entry *cpu_trace_slot(uaecptr pc)
+{
+	uae_u32 hash = (pc >> 1) ^ (pc >> 9) ^ (pc >> 17);
+	return &cpu_trace_cache[hash & (CPU_TRACE_SLOTS - 1)];
+}
+
+static inline int cpu_trace_execute(cpuop_func **tbl)
+{
+	const uaecptr start_pc = m68k_getpc();
+	cpu_trace_entry *trace = cpu_trace_slot(start_pc);
+
+	// Validate the entry opcode on every use. FlushCPUTraceCache covers normal
+	// Mac OS code-patch notifications; this check also catches unannounced SMC
+	// at a trace boundary for one guest read per eight cached instructions.
+	if (likely(trace->count != 0 && trace->start_pc == start_pc &&
+	           GET_OPCODE == trace->items[0].opcode)) {
+		const int count = trace->count;
+		for (int i = 0; i < count; ++i) {
+			const cpu_trace_item *item = &trace->items[i];
+			(*item->handler)(item->opcode);
+			if (unlikely(m68k_getpc() != item->expected_next_pc)) {
+				return i + 1;
+			}
+		}
+		return count;
+	}
+
+	// Miss/collision: execute once through the normal interpreter while
+	// recording the exact path, then publish the entry by setting count last.
+	trace->count = 0;
+	trace->start_pc = start_pc;
+	for (int i = 0; i < CPU_TRACE_LENGTH; ++i) {
+		cpu_trace_item *item = &trace->items[i];
+		const uae_u32 opcode = GET_OPCODE;
+		item->opcode = (uae_u16)opcode;
+		item->handler = tbl[opcode];
+		(*item->handler)(opcode);
+		item->expected_next_pc = m68k_getpc();
+	}
+	trace->count = CPU_TRACE_LENGTH;
+	return CPU_TRACE_LENGTH;
+}
+#else
+void FlushCPUTraceCache(void) {}
+#endif
+
+#if FLIGHT_RECORDER
+struct rec_step {
+	uae_u32 pc;
+#if FLIGHT_RECORDER >= 2
+	uae_u32 d[8];
+	uae_u32 a[8];
+#endif
+};
+
+const int LOG_SIZE = 32768;
+static rec_step log[LOG_SIZE];
+static int log_ptr = -1; // First time initialization
+
+static const char *log_filename(void)
+{
+	const char *name = getenv("M68K_LOG_FILE");
+	return name ? name : "log.68k";
+}
+
+void m68k_record_step(uaecptr pc)
+{
+#if FLIGHT_RECORDER >= 2
+	/* XXX: if LSB is set, we are recording from generated code and we
+	   don't support registers recording yet.  */
+	if ((pc & 1) == 0) {
+		for (int i = 0; i < 8; i++) {
+			log[log_ptr].d[i] = m68k_dreg(regs, i);
+			log[log_ptr].a[i] = m68k_areg(regs, i);
+		}
+	}
+#endif
+	log[log_ptr].pc = pc;
+	log_ptr = (log_ptr + 1) % LOG_SIZE;
+}
+
+static void dump_log(void)
+{
+	FILE *f = fopen(log_filename(), "w");
+	if (f == NULL)
+		return;
+	for (int i = 0; i < LOG_SIZE; i++) {
+		int j = (i + log_ptr) % LOG_SIZE;
+		uae_u32 pc = log[j].pc & ~1;
+		fprintf(f, "pc %08x", pc);
+#if FLIGHT_RECORDER >= 2
+		fprintf(f, "\n");
+		if ((log[j].pc & 1) == 0) {
+			fprintf(f, "d0 %08x d1 %08x d2 %08x d3 %08x\n", log[j].d[0], log[j].d[1], log[j].d[2], log[j].d[3]);
+			fprintf(f, "d4 %08x d5 %08x d6 %08x d7 %08x\n", log[j].d[4], log[j].d[5], log[j].d[6], log[j].d[7]);
+			fprintf(f, "a0 %08x a1 %08x a2 %08x a3 %08x\n", log[j].a[0], log[j].a[1], log[j].a[2], log[j].a[3]);
+			fprintf(f, "a4 %08x a5 %08x a6 %08x a7 %08x\n", log[j].a[4], log[j].a[5], log[j].a[6], log[j].a[7]);
+		}
+#else
+		fprintf(f, " | ");
+#endif
+#if ENABLE_MON
+		disass_68k(f, pc);
+#endif
+	}
+	fclose(f);
+}
+#endif
+
+#if ENABLE_MON
+static void dump_regs(void)
+{
+	m68k_dumpstate(NULL);
+}
+#endif
+
+#define COUNT_INSTRS 0
+
+#if COUNT_INSTRS
+static unsigned long int instrcount[65536];
+static uae_u16 opcodenums[65536];
+
+static int compfn (const void *el1, const void *el2)
+{
+	return instrcount[*(const uae_u16 *)el1] < instrcount[*(const uae_u16 *)el2];
+}
+
+static char *icountfilename (void)
+{
+	char *name = getenv ("INSNCOUNT");
+	if (name)
+		return name;
+	return COUNT_INSTRS == 2 ? "frequent.68k" : "insncount";
+}
+
+void dump_counts (void)
+{
+	FILE *f = fopen (icountfilename (), "w");
+	unsigned long int total;
+	int i;
+
+	write_log ("Writing instruction count file...\n");
+	for (i = 0; i < 65536; i++) {
+		opcodenums[i] = i;
+		total += instrcount[i];
+	}
+	qsort (opcodenums, 65536, sizeof(uae_u16), compfn);
+
+	fprintf (f, "Total: %lu\n", total);
+	for (i=0; i < 65536; i++) {
+		unsigned long int cnt = instrcount[opcodenums[i]];
+		struct instr *dp;
+		struct mnemolookup *lookup;
+		if (!cnt)
+			break;
+		dp = table68k + opcodenums[i];
+		for (lookup = lookuptab;lookup->mnemo != dp->mnemo; lookup++)
+			;
+		fprintf (f, "%04x: %lu %s\n", opcodenums[i], cnt, lookup->name);
+	}
+	fclose (f);
+}
+#else
+void dump_counts (void)
+{
+}
+#endif
+
+int broken_in;
+
+#ifndef CPU_CORE_PROFILE
+#define CPU_CORE_PROFILE 0
+#endif
+
+#if CPU_CORE_PROFILE
+// Lightweight CPU hot-loop profiling counters.
+static volatile uint64_t cpu_prof_batches = 0;
+static volatile uint64_t cpu_prof_instructions = 0;
+static volatile uint64_t cpu_prof_special_breaks = 0;
+static volatile uint64_t cpu_prof_tick_checks = 0;
+static volatile uint64_t cpu_prof_special_calls = 0;
+static volatile uint64_t cpu_prof_flag_int = 0;
+static volatile uint64_t cpu_prof_flag_doint = 0;
+static volatile uint64_t cpu_prof_flag_brk = 0;
+static volatile uint64_t cpu_prof_flag_trace = 0;
+static volatile uint64_t cpu_prof_flag_stop = 0;
+static volatile uint32_t cpu_prof_last_report_ms = 0;
+#endif
+
+static __inline__ unsigned int cft_map (unsigned int f)
+{
+#ifndef HAVE_GET_WORD_UNSWAPPED
+	return f;
+#else
+	return ((f >> 8) & 255) | ((f & 255) << 8);
+#endif
+}
+
+void REGPARAM2 op_illg_1 (uae_u32 opcode) REGPARAM;
+
+void REGPARAM2 op_illg_1 (uae_u32 opcode)
+{
+	op_illg (cft_map (opcode));
+}
+
+static void build_cpufunctbl (void)
+{
+	int i;
+	unsigned long opcode;
+	unsigned int cpu_level = 0;		// 68000 (default)
+	if (CPUType == 4)
+		cpu_level = 4;		// 68040 with FPU
+	else {
+		if (FPUType)
+			cpu_level = 3;	// 68020 with FPU
+		else if (CPUType >= 2)
+			cpu_level = 2;	// 68020
+		else if (CPUType == 1)
+			cpu_level = 1;
+	}
+	const struct cputbl *tbl = (
+				cpu_level == 4 ? op_smalltbl_0_ff
+				: cpu_level == 3 ? op_smalltbl_1_ff
+				: cpu_level == 2 ? op_smalltbl_2_ff
+				: cpu_level == 1 ? op_smalltbl_3_ff
+				: op_smalltbl_4_ff);
+
+	for (opcode = 0; opcode < 65536; opcode++)
+		cpufunctbl[cft_map(opcode)] = op_illg_1;
+	for (i = 0; tbl[i].handler != NULL; i++) {
+		if (! tbl[i].specific)
+			cpufunctbl[cft_map(tbl[i].opcode)] = tbl[i].handler;
+	}
+	for (opcode = 0; opcode < 65536; opcode++) {
+		cpuop_func *f;
+
+		if (table68k[opcode].mnemo == i_ILLG || table68k[opcode].clev > cpu_level)
+			continue;
+
+		if (table68k[opcode].handler != -1) {
+			f = cpufunctbl[cft_map(table68k[opcode].handler)];
+			if (f == op_illg_1)
+				abort();
+			cpufunctbl[cft_map(opcode)] = f;
+		}
+	}
+	for (i = 0; tbl[i].handler != NULL; i++) {
+		if (tbl[i].specific)
+			cpufunctbl[cft_map(tbl[i].opcode)] = tbl[i].handler;
+	}
+}
+
+void init_m68k (void)
+{
+	int i;
+
+	// movem tables are now const and pre-computed at compile time
+	(void)i;  // silence unused variable warning
+
+	// Allocate lastint_regs in PSRAM (only used for debugging)
+	if (lastint_regs_ptr == NULL) {
+#ifdef ARDUINO
+		lastint_regs_ptr = (struct regstruct *)heap_caps_malloc(sizeof(struct regstruct), MALLOC_CAP_SPIRAM);
+#else
+		lastint_regs_ptr = (struct regstruct *)malloc(sizeof(struct regstruct));
+#endif
+		if (lastint_regs_ptr) {
+			memset(lastint_regs_ptr, 0, sizeof(struct regstruct));
+		}
+	}
+
+#if COUNT_INSTRS
+	{
+		FILE *f = fopen (icountfilename (), "r");
+		memset (instrcount, 0, sizeof instrcount);
+		if (f) {
+			uae_u32 opcode, count, total;
+			char name[20];
+			write_log ("Reading instruction count file...\n");
+			fscanf (f, "Total: %lu\n", &total);
+			while (fscanf (f, "%lx: %lu %s\n", &opcode, &count, name) == 3) {
+				instrcount[opcode] = count;
+			}
+			fclose(f);
+		}
+	}
+#endif
+	read_table68k ();
+	do_merges ();
+
+	build_cpufunctbl ();
+#if CPU_COMPACT_DISPATCH
+	// Only needed when the full 256KB table is in PSRAM.
+	build_compact_dispatch();
+#endif
+
+#if defined(ENABLE_EXCLUSIVE_SPCFLAGS) && !defined(HAVE_HARDWARE_LOCKS)
+	spcflags_lock = B2_create_mutex();
+#endif
+	fpu_init(CPUType == 4);
+}
+
+void exit_m68k (void)
+{
+#if CPU_COMPACT_DISPATCH
+	free_compact_dispatch();
+#endif
+	fpu_exit ();
+#if defined(ENABLE_EXCLUSIVE_SPCFLAGS) && !defined(HAVE_HARDWARE_LOCKS)
+	B2_delete_mutex(spcflags_lock);
+#endif
+}
+
+// CPU registers are touched by every handler: internal SRAM, gp-relative.
+SDATA_ATTR("cpu_regs") struct regstruct regs;
+struct regstruct *lastint_regs_ptr = NULL;
+#define lastint_regs (*lastint_regs_ptr)
+// regs_backup removed - was 1856 bytes and never used
+static long int m68kpc_offset;
+int lastint_no;
+
+#if REAL_ADDRESSING || DIRECT_ADDRESSING
+#define get_ibyte_1(o) get_byte(get_virtual_address(regs.pc_p) + (o) + 1)
+#define get_iword_1(o) get_word(get_virtual_address(regs.pc_p) + (o))
+#define get_ilong_1(o) get_long(get_virtual_address(regs.pc_p) + (o))
+#else
+#define get_ibyte_1(o) get_byte(regs.pc + (regs.pc_p - regs.pc_oldp) + (o) + 1)
+#define get_iword_1(o) get_word(regs.pc + (regs.pc_p - regs.pc_oldp) + (o))
+#define get_ilong_1(o) get_long(regs.pc + (regs.pc_p - regs.pc_oldp) + (o))
+#endif
+
+uae_s32 ShowEA (int reg, amodes mode, wordsizes size, char *buf)
+{
+	uae_u16 dp;
+	uae_s8 disp8;
+	uae_s16 disp16;
+	int r;
+	uae_u32 dispreg;
+	uaecptr addr;
+	uae_s32 offset = 0;
+	char buffer[80];
+
+	switch (mode){
+	case Dreg:
+		sprintf (buffer,"D%d", reg);
+		break;
+	case Areg:
+		sprintf (buffer,"A%d", reg);
+		break;
+	case Aind:
+		sprintf (buffer,"(A%d)", reg);
+		break;
+	case Aipi:
+		sprintf (buffer,"(A%d)+", reg);
+		break;
+	case Apdi:
+		sprintf (buffer,"-(A%d)", reg);
+		break;
+	case Ad16:
+		disp16 = get_iword_1 (m68kpc_offset); m68kpc_offset += 2;
+		addr = m68k_areg(regs,reg) + (uae_s16)disp16;
+		sprintf (buffer,"(A%d,$%04x) == $%08lx", reg, disp16 & 0xffff,
+				 (unsigned long)addr);
+		break;
+	case Ad8r:
+		dp = get_iword_1 (m68kpc_offset); m68kpc_offset += 2;
+		disp8 = dp & 0xFF;
+		r = (dp & 0x7000) >> 12;
+		dispreg = dp & 0x8000 ? m68k_areg(regs,r) : m68k_dreg(regs,r);
+		if (!(dp & 0x800)) dispreg = (uae_s32)(uae_s16)(dispreg);
+		dispreg <<= (dp >> 9) & 3;
+
+		if (dp & 0x100) {
+			uae_s32 outer = 0, disp = 0;
+			uae_s32 base = m68k_areg(regs,reg);
+			char name[10];
+			sprintf (name,"A%d, ",reg);
+			if (dp & 0x80) { base = 0; name[0] = 0; }
+			if (dp & 0x40) dispreg = 0;
+			if ((dp & 0x30) == 0x20) { disp = (uae_s32)(uae_s16)get_iword_1 (m68kpc_offset); m68kpc_offset += 2; }
+			if ((dp & 0x30) == 0x30) { disp = get_ilong_1 (m68kpc_offset); m68kpc_offset += 4; }
+			base += disp;
+
+			if ((dp & 0x3) == 0x2) { outer = (uae_s32)(uae_s16)get_iword_1 (m68kpc_offset); m68kpc_offset += 2; }
+			if ((dp & 0x3) == 0x3) { outer = get_ilong_1 (m68kpc_offset); m68kpc_offset += 4; }
+
+			if (!(dp & 4)) base += dispreg;
+			if (dp & 3) base = get_long (base);
+			if (dp & 4) base += dispreg;
+
+			addr = base + outer;
+			sprintf (buffer,"(%s%c%d.%c*%d+%d)+%d == $%08lx", name,
+					 dp & 0x8000 ? 'A' : 'D', (int)r, dp & 0x800 ? 'L' : 'W',
+					 1 << ((dp >> 9) & 3),
+					 disp,outer,
+					 (unsigned long)addr);
+		} else {
+			addr = m68k_areg(regs,reg) + (uae_s32)((uae_s8)disp8) + dispreg;
+			sprintf (buffer,"(A%d, %c%d.%c*%d, $%02x) == $%08lx", reg,
+					 dp & 0x8000 ? 'A' : 'D', (int)r, dp & 0x800 ? 'L' : 'W',
+					 1 << ((dp >> 9) & 3), disp8,
+					 (unsigned long)addr);
+		}
+		break;
+	case PC16:
+		addr = m68k_getpc () + m68kpc_offset;
+		disp16 = get_iword_1 (m68kpc_offset); m68kpc_offset += 2;
+		addr += (uae_s16)disp16;
+		sprintf (buffer,"(PC,$%04x) == $%08lx", disp16 & 0xffff,(unsigned long)addr);
+		break;
+	case PC8r:
+		addr = m68k_getpc () + m68kpc_offset;
+		dp = get_iword_1 (m68kpc_offset); m68kpc_offset += 2;
+		disp8 = dp & 0xFF;
+		r = (dp & 0x7000) >> 12;
+		dispreg = dp & 0x8000 ? m68k_areg(regs,r) : m68k_dreg(regs,r);
+		if (!(dp & 0x800)) dispreg = (uae_s32)(uae_s16)(dispreg);
+		dispreg <<= (dp >> 9) & 3;
+
+		if (dp & 0x100) {
+			uae_s32 outer = 0,disp = 0;
+			uae_s32 base = addr;
+			char name[10];
+			sprintf (name,"PC, ");
+			if (dp & 0x80) { base = 0; name[0] = 0; }
+			if (dp & 0x40) dispreg = 0;
+			if ((dp & 0x30) == 0x20) { disp = (uae_s32)(uae_s16)get_iword_1 (m68kpc_offset); m68kpc_offset += 2; }
+			if ((dp & 0x30) == 0x30) { disp = get_ilong_1 (m68kpc_offset); m68kpc_offset += 4; }
+			base += disp;
+
+			if ((dp & 0x3) == 0x2) { outer = (uae_s32)(uae_s16)get_iword_1 (m68kpc_offset); m68kpc_offset += 2; }
+			if ((dp & 0x3) == 0x3) { outer = get_ilong_1 (m68kpc_offset); m68kpc_offset += 4; }
+
+			if (!(dp & 4)) base += dispreg;
+			if (dp & 3) base = get_long (base);
+			if (dp & 4) base += dispreg;
+
+			addr = base + outer;
+			sprintf (buffer,"(%s%c%d.%c*%d+%d)+%d == $%08lx", name,
+					 dp & 0x8000 ? 'A' : 'D', (int)r, dp & 0x800 ? 'L' : 'W',
+					 1 << ((dp >> 9) & 3),
+					 disp,outer,
+					 (unsigned long)addr);
+		} else {
+			addr += (uae_s32)((uae_s8)disp8) + dispreg;
+			sprintf (buffer,"(PC, %c%d.%c*%d, $%02x) == $%08lx", dp & 0x8000 ? 'A' : 'D',
+					 (int)r, dp & 0x800 ? 'L' : 'W',  1 << ((dp >> 9) & 3),
+					 disp8, (unsigned long)addr);
+		}
+		break;
+	case absw:
+		sprintf (buffer,"$%08lx", (unsigned long)(uae_s32)(uae_s16)get_iword_1 (m68kpc_offset));
+		m68kpc_offset += 2;
+		break;
+	case absl:
+		sprintf (buffer,"$%08lx", (unsigned long)get_ilong_1 (m68kpc_offset));
+		m68kpc_offset += 4;
+		break;
+	case imm:
+		switch (size){
+		case sz_byte:
+			sprintf (buffer,"#$%02x", (unsigned int)(get_iword_1 (m68kpc_offset) & 0xff));
+			m68kpc_offset += 2;
+			break;
+		case sz_word:
+			sprintf (buffer,"#$%04x", (unsigned int)(get_iword_1 (m68kpc_offset) & 0xffff));
+			m68kpc_offset += 2;
+			break;
+		case sz_long:
+			sprintf (buffer,"#$%08lx", (unsigned long)(get_ilong_1 (m68kpc_offset)));
+			m68kpc_offset += 4;
+			break;
+		default:
+			break;
+		}
+		break;
+	case imm0:
+		offset = (uae_s32)(uae_s8)get_iword_1 (m68kpc_offset);
+		m68kpc_offset += 2;
+		sprintf (buffer,"#$%02x", (unsigned int)(offset & 0xff));
+		break;
+	case imm1:
+		offset = (uae_s32)(uae_s16)get_iword_1 (m68kpc_offset);
+		m68kpc_offset += 2;
+		sprintf (buffer,"#$%04x", (unsigned int)(offset & 0xffff));
+		break;
+	case imm2:
+		offset = (uae_s32)get_ilong_1 (m68kpc_offset);
+		m68kpc_offset += 4;
+		sprintf (buffer,"#$%08lx", (unsigned long)offset);
+		break;
+	case immi:
+		offset = (uae_s32)(uae_s8)(reg & 0xff);
+		sprintf (buffer,"#$%08lx", (unsigned long)offset);
+		break;
+	default:
+		break;
+	}
+	if (buf == 0)
+		printf ("%s", buffer);
+	else
+		strcat (buf, buffer);
+	return offset;
+}
+
+/* The plan is that this will take over the job of exception 3 handling -
+ * the CPU emulation functions will just do a longjmp to m68k_go whenever
+ * they hit an odd address. */
+static int verify_ea (int reg, amodes mode, wordsizes size, uae_u32 *val)
+{
+	uae_u16 dp;
+	uae_s8 disp8;
+	uae_s16 disp16;
+	int r;
+	uae_u32 dispreg;
+	uaecptr addr;
+	uae_s32 offset = 0;
+
+	switch (mode){
+	case Dreg:
+		*val = m68k_dreg (regs, reg);
+		return 1;
+	case Areg:
+		*val = m68k_areg (regs, reg);
+		return 1;
+
+	case Aind:
+	case Aipi:
+		addr = m68k_areg (regs, reg);
+		break;
+	case Apdi:
+		addr = m68k_areg (regs, reg);
+		break;
+	case Ad16:
+		disp16 = get_iword_1 (m68kpc_offset); m68kpc_offset += 2;
+		addr = m68k_areg(regs,reg) + (uae_s16)disp16;
+		break;
+	case Ad8r:
+		addr = m68k_areg (regs, reg);
+d8r_common:
+		dp = get_iword_1 (m68kpc_offset); m68kpc_offset += 2;
+		disp8 = dp & 0xFF;
+		r = (dp & 0x7000) >> 12;
+		dispreg = dp & 0x8000 ? m68k_areg(regs,r) : m68k_dreg(regs,r);
+		if (!(dp & 0x800)) dispreg = (uae_s32)(uae_s16)(dispreg);
+		dispreg <<= (dp >> 9) & 3;
+
+		if (dp & 0x100) {
+			uae_s32 outer = 0, disp = 0;
+			uae_s32 base = addr;
+			if (dp & 0x80) base = 0;
+			if (dp & 0x40) dispreg = 0;
+			if ((dp & 0x30) == 0x20) { disp = (uae_s32)(uae_s16)get_iword_1 (m68kpc_offset); m68kpc_offset += 2; }
+			if ((dp & 0x30) == 0x30) { disp = get_ilong_1 (m68kpc_offset); m68kpc_offset += 4; }
+			base += disp;
+
+			if ((dp & 0x3) == 0x2) { outer = (uae_s32)(uae_s16)get_iword_1 (m68kpc_offset); m68kpc_offset += 2; }
+			if ((dp & 0x3) == 0x3) { outer = get_ilong_1 (m68kpc_offset); m68kpc_offset += 4; }
+
+			if (!(dp & 4)) base += dispreg;
+			if (dp & 3) base = get_long (base);
+			if (dp & 4) base += dispreg;
+
+			addr = base + outer;
+		} else {
+			addr += (uae_s32)((uae_s8)disp8) + dispreg;
+		}
+		break;
+	case PC16:
+		addr = m68k_getpc () + m68kpc_offset;
+		disp16 = get_iword_1 (m68kpc_offset); m68kpc_offset += 2;
+		addr += (uae_s16)disp16;
+		break;
+	case PC8r:
+		addr = m68k_getpc () + m68kpc_offset;
+		goto d8r_common;
+	case absw:
+		addr = (uae_s32)(uae_s16)get_iword_1 (m68kpc_offset);
+		m68kpc_offset += 2;
+		break;
+	case absl:
+		addr = get_ilong_1 (m68kpc_offset);
+		m68kpc_offset += 4;
+		break;
+	case imm:
+		switch (size){
+		case sz_byte:
+			*val = get_iword_1 (m68kpc_offset) & 0xff;
+			m68kpc_offset += 2;
+			break;
+		case sz_word:
+			*val = get_iword_1 (m68kpc_offset) & 0xffff;
+			m68kpc_offset += 2;
+			break;
+		case sz_long:
+			*val = get_ilong_1 (m68kpc_offset);
+			m68kpc_offset += 4;
+			break;
+		default:
+			break;
+		}
+		return 1;
+	case imm0:
+		*val = (uae_s32)(uae_s8)get_iword_1 (m68kpc_offset);
+		m68kpc_offset += 2;
+		return 1;
+	case imm1:
+		*val = (uae_s32)(uae_s16)get_iword_1 (m68kpc_offset);
+		m68kpc_offset += 2;
+		return 1;
+	case imm2:
+		*val = get_ilong_1 (m68kpc_offset);
+		m68kpc_offset += 4;
+		return 1;
+	case immi:
+		*val = (uae_s32)(uae_s8)(reg & 0xff);
+		return 1;
+	default:
+		addr = 0;
+		break;
+	}
+	if ((addr & 1) == 0)
+		return 1;
+
+	last_addr_for_exception_3 = m68k_getpc () + m68kpc_offset;
+	last_fault_for_exception_3 = addr;
+	return 0;
+}
+
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
+uae_u32 get_disp_ea_020_full (uae_u32 base, uae_u32 dp)
+{
+	int reg = (dp >> 12) & 15;
+	uae_s32 regd = regs.regs[reg];
+	if ((dp & 0x800) == 0)
+		regd = (uae_s32)(uae_s16)regd;
+	regd <<= (dp >> 9) & 3;
+	if (dp & 0x100) {
+		uae_s32 outer = 0;
+		if (dp & 0x80) base = 0;
+		if (dp & 0x40) regd = 0;
+
+		if ((dp & 0x30) == 0x20) base += (uae_s32)(uae_s16)next_iword();
+		if ((dp & 0x30) == 0x30) base += next_ilong();
+
+		if ((dp & 0x3) == 0x2) outer = (uae_s32)(uae_s16)next_iword();
+		if ((dp & 0x3) == 0x3) outer = next_ilong();
+
+		if ((dp & 0x4) == 0) base += regd;
+		if (dp & 0x3) base = get_long (base);
+		if (dp & 0x4) base += regd;
+
+		return base + outer;
+	} else {
+		return base + (uae_s32)((uae_s8)dp) + regd;
+	}
+}
+
+uae_u32 get_disp_ea_000 (uae_u32 base, uae_u32 dp)
+{
+	int reg = (dp >> 12) & 15;
+	uae_s32 regd = regs.regs[reg];
+#if 1
+	if ((dp & 0x800) == 0)
+		regd = (uae_s32)(uae_s16)regd;
+	return base + (uae_s8)dp + regd;
+#else
+	/* Branch-free code... benchmark this again now that
+	 * things are no longer inline.  */
+	uae_s32 regd16;
+	uae_u32 mask;
+	mask = ((dp & 0x800) >> 11) - 1;
+	regd16 = (uae_s32)(uae_s16)regd;
+	regd16 &= mask;
+	mask = ~mask;
+	base += (uae_s8)dp;
+	regd &= mask;
+	regd |= regd16;
+	return base + regd;
+#endif
+}
+
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
+void MakeSR (void)
+{
+#if 0
+	assert((regs.t1 & 1) == regs.t1);
+	assert((regs.t0 & 1) == regs.t0);
+	assert((regs.s & 1) == regs.s);
+	assert((regs.m & 1) == regs.m);
+	assert((XFLG & 1) == XFLG);
+	assert((NFLG & 1) == NFLG);
+	assert((ZFLG & 1) == ZFLG);
+	assert((VFLG & 1) == VFLG);
+	assert((CFLG & 1) == CFLG);
+#endif
+	regs.sr = ((regs.t1 << 15) | (regs.t0 << 14)
+			   | (regs.s << 13) | (regs.m << 12) | (regs.intmask << 8)
+			   | (GET_XFLG << 4) | (GET_NFLG << 3) | (GET_ZFLG << 2) | (GET_VFLG << 1)
+			   | GET_CFLG);
+}
+
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
+void MakeFromSR (void)
+{
+	int oldm = regs.m;
+	int olds = regs.s;
+	int oldintmask = regs.intmask;
+
+	regs.t1 = (regs.sr >> 15) & 1;
+	regs.t0 = (regs.sr >> 14) & 1;
+	regs.s = (regs.sr >> 13) & 1;
+	regs.m = (regs.sr >> 12) & 1;
+	regs.intmask = (regs.sr >> 8) & 7;
+	SET_XFLG ((regs.sr >> 4) & 1);
+	SET_NFLG ((regs.sr >> 3) & 1);
+	SET_ZFLG ((regs.sr >> 2) & 1);
+	SET_VFLG ((regs.sr >> 1) & 1);
+	SET_CFLG (regs.sr & 1);
+	if (CPUType >= 2) {
+		if (olds != regs.s) {
+			if (olds) {
+				if (oldm)
+					regs.msp = m68k_areg(regs, 7);
+				else
+					regs.isp = m68k_areg(regs, 7);
+				m68k_areg(regs, 7) = regs.usp;
+			} else {
+				regs.usp = m68k_areg(regs, 7);
+				m68k_areg(regs, 7) = regs.m ? regs.msp : regs.isp;
+			}
+		} else if (olds && oldm != regs.m) {
+			if (oldm) {
+				regs.msp = m68k_areg(regs, 7);
+				m68k_areg(regs, 7) = regs.isp;
+			} else {
+				regs.isp = m68k_areg(regs, 7);
+				m68k_areg(regs, 7) = regs.msp;
+			}
+		}
+	} else {
+		if (olds != regs.s) {
+			if (olds) {
+				regs.isp = m68k_areg(regs, 7);
+				m68k_areg(regs, 7) = regs.usp;
+			} else {
+				regs.usp = m68k_areg(regs, 7);
+				m68k_areg(regs, 7) = regs.isp;
+			}
+		}
+	}
+
+	// Re-check interrupt level only when IMASK changed and an external IRQ is pending.
+	// This avoids INT->DOINT churn on frequent SR updates during normal execution.
+	if (regs.intmask != oldintmask &&
+	    __atomic_load_n(&InterruptFlags, __ATOMIC_RELAXED) != 0) {
+		SPCFLAGS_SET(SPCFLAG_DOINT);
+	}
+	if (regs.t1 || regs.t0)
+		SPCFLAGS_SET( SPCFLAG_TRACE );
+	else
+		/* Keep SPCFLAG_DOTRACE, we still want a trace exception for
+	   SR-modifying instructions (including STOP).  */
+		SPCFLAGS_CLEAR( SPCFLAG_TRACE );
+}
+
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
+void Exception(int nr, uaecptr oldpc)
+{
+	uae_u32 currpc = m68k_getpc ();
+	MakeSR();
+	if (!regs.s) {
+		regs.usp = m68k_areg(regs, 7);
+		if (CPUType >= 2)
+			m68k_areg(regs, 7) = regs.m ? regs.msp : regs.isp;
+		else
+			m68k_areg(regs, 7) = regs.isp;
+		regs.s = 1;
+	}
+	if (CPUType > 0) {
+		if (nr == 2 || nr == 3) {
+			int i;
+			/* @@@ this is probably wrong (?) */
+			for (i = 0 ; i < 12 ; i++) {
+				m68k_areg(regs, 7) -= 2;
+				put_word (m68k_areg(regs, 7), 0);
+			}
+			m68k_areg(regs, 7) -= 2;
+			put_word (m68k_areg(regs, 7), 0xa000 + nr * 4);
+		} else if (nr ==5 || nr == 6 || nr == 7 || nr == 9) {
+			m68k_areg(regs, 7) -= 4;
+			put_long (m68k_areg(regs, 7), oldpc);
+			m68k_areg(regs, 7) -= 2;
+			put_word (m68k_areg(regs, 7), 0x2000 + nr * 4);
+		} else if (regs.m && nr >= 24 && nr < 32) {
+			m68k_areg(regs, 7) -= 2;
+			put_word (m68k_areg(regs, 7), nr * 4);
+			m68k_areg(regs, 7) -= 4;
+			put_long (m68k_areg(regs, 7), currpc);
+			m68k_areg(regs, 7) -= 2;
+			put_word (m68k_areg(regs, 7), regs.sr);
+			regs.sr |= (1 << 13);
+			regs.msp = m68k_areg(regs, 7);
+			m68k_areg(regs, 7) = regs.isp;
+			m68k_areg(regs, 7) -= 2;
+			put_word (m68k_areg(regs, 7), 0x1000 + nr * 4);
+		} else {
+			m68k_areg(regs, 7) -= 2;
+			put_word (m68k_areg(regs, 7), nr * 4);
+		}
+	} else {
+		if (nr == 2 || nr == 3) {
+			m68k_areg(regs, 7) -= 12;
+			/* ??????? */
+			if (nr == 3) {
+				put_long (m68k_areg(regs, 7), last_fault_for_exception_3);
+				put_word (m68k_areg(regs, 7)+4, last_op_for_exception_3);
+				put_long (m68k_areg(regs, 7)+8, last_addr_for_exception_3);
+			}
+			write_log ("Exception!\n");
+			goto kludge_me_do;
+		}
+	}
+	m68k_areg(regs, 7) -= 4;
+	put_long (m68k_areg(regs, 7), currpc);
+kludge_me_do:
+	m68k_areg(regs, 7) -= 2;
+	put_word (m68k_areg(regs, 7), regs.sr);
+	m68k_setpc (get_long (regs.vbr + 4*nr));
+	SPCFLAGS_SET( SPCFLAG_JIT_END_COMPILE );
+	fill_prefetch_0 ();
+	regs.t1 = regs.t0 = regs.m = 0;
+	SPCFLAGS_CLEAR( SPCFLAG_TRACE | SPCFLAG_DOTRACE );
+}
+
+static void Interrupt(int nr)
+{
+	assert(nr < 8 && nr >= 0);
+	lastint_regs = regs;
+	lastint_no = nr;
+	Exception(nr+24, 0);
+
+	regs.intmask = nr;
+	// On the ESP32 port, repeatedly re-arming SPCFLAG_INT here causes heavy
+	// INT/DOINT churn in the hot loop while level-1 IRQ handlers are running.
+	// External IRQ sources explicitly retrigger via TriggerInterrupt().
+}
+
+static int caar, cacr, tc, itt0, itt1, dtt0, dtt1, mmusr, urp, srp;
+
+static int movec_illg (int regno)
+{
+	switch (CPUType) {
+	case 1:
+		if ((regno & 0x7ff) <= 1)
+			return 0;
+		break;
+	case 2:
+	case 3:
+		if ((regno & 0x7ff) <= 2)
+			return 0;
+		if (regno == 0x803 || regno == 0x804)
+			return 0;
+		break;
+	case 4:
+		if ((regno & 0x7ff) <= 7) {
+			if (regno != 0x802)
+				return 0;
+		}
+		break;
+	}
+	return 1;
+}
+
+int m68k_move2c (int regno, uae_u32 *regp)
+{
+	if (movec_illg (regno)) {
+		op_illg (0x4E7B);
+		return 0;
+	} else {
+		switch (regno) {
+		case 0: regs.sfc = *regp & 7; break;
+		case 1: regs.dfc = *regp & 7; break;
+		case 2:
+			cacr = *regp & (CPUType < 4 ? 0x3 : 0x80008000);
+#if USE_JIT
+			if (CPUType < 4) {
+				set_cache_state(cacr&1);
+				if (*regp & 0x08)
+					flush_icache(1);
+			}
+			else {
+				set_cache_state(cacr&0x8000);
+			}
+#endif
+			break;
+		case 3: tc = *regp & 0xc000; break;
+		case 4: itt0 = *regp & 0xffffe364; break;
+		case 5: itt1 = *regp & 0xffffe364; break;
+		case 6: dtt0 = *regp & 0xffffe364; break;
+		case 7: dtt1 = *regp & 0xffffe364; break;
+		case 0x800: regs.usp = *regp; break;
+		case 0x801: regs.vbr = *regp; break;
+		case 0x802: caar = *regp &0xfc; break;
+		case 0x803: regs.msp = *regp; if (regs.m == 1) m68k_areg(regs, 7) = regs.msp; break;
+		case 0x804: regs.isp = *regp; if (regs.m == 0) m68k_areg(regs, 7) = regs.isp; break;
+		case 0x805: mmusr = *regp; break;
+		case 0x806: urp = *regp; break;
+		case 0x807: srp = *regp; break;
+		default:
+			op_illg (0x4E7B);
+			return 0;
+		}
+	}
+	return 1;
+}
+
+int m68k_movec2 (int regno, uae_u32 *regp)
+{
+	if (movec_illg (regno))
+	{
+		op_illg (0x4E7A);
+		return 0;
+	} else {
+		switch (regno) {
+		case 0: *regp = regs.sfc; break;
+		case 1: *regp = regs.dfc; break;
+		case 2: *regp = cacr; break;
+		case 3: *regp = tc; break;
+		case 4: *regp = itt0; break;
+		case 5: *regp = itt1; break;
+		case 6: *regp = dtt0; break;
+		case 7: *regp = dtt1; break;
+		case 0x800: *regp = regs.usp; break;
+		case 0x801: *regp = regs.vbr; break;
+		case 0x802: *regp = caar; break;
+		case 0x803: *regp = regs.m == 1 ? m68k_areg(regs, 7) : regs.msp; break;
+		case 0x804: *regp = regs.m == 0 ? m68k_areg(regs, 7) : regs.isp; break;
+		case 0x805: *regp = mmusr; break;
+		case 0x806: *regp = urp; break;
+		case 0x807: *regp = srp; break;
+		default:
+			op_illg (0x4E7A);
+			return 0;
+		}
+	}
+	return 1;
+}
+
+#if !defined(uae_s64)
+static __inline__ int
+div_unsigned(uae_u32 src_hi, uae_u32 src_lo, uae_u32 div, uae_u32 *quot, uae_u32 *rem)
+{
+	uae_u32 q = 0, cbit = 0;
+	int i;
+
+	if (div <= src_hi) {
+		return 1;
+	}
+	for (i = 0 ; i < 32 ; i++) {
+		cbit = src_hi & 0x80000000ul;
+		src_hi <<= 1;
+		if (src_lo & 0x80000000ul) src_hi++;
+		src_lo <<= 1;
+		q = q << 1;
+		if (cbit || div <= src_hi) {
+			q |= 1;
+			src_hi -= div;
+		}
+	}
+	*quot = q;
+	*rem = src_hi;
+	return 0;
+}
+#endif
+
+void m68k_divl (uae_u32 opcode, uae_u32 src, uae_u16 extra, uaecptr oldpc)
+{
+#if defined(uae_s64)
+	if (src == 0) {
+		Exception (5, oldpc);
+		return;
+	}
+	if (extra & 0x800) {
+		/* signed variant */
+		uae_s64 a = (uae_s64)(uae_s32)m68k_dreg(regs, (extra >> 12) & 7);
+		uae_s64 quot, rem;
+
+		if (extra & 0x400) {
+			a &= 0xffffffffu;
+			a |= (uae_s64)m68k_dreg(regs, extra & 7) << 32;
+		}
+		rem = a % (uae_s64)(uae_s32)src;
+		quot = a / (uae_s64)(uae_s32)src;
+		if ((quot & UVAL64(0xffffffff80000000)) != 0
+				&& (quot & UVAL64(0xffffffff80000000)) != UVAL64(0xffffffff80000000))
+		{
+			SET_VFLG (1);
+			SET_NFLG (1);
+			SET_CFLG (0);
+		} else {
+			if (((uae_s32)rem < 0) != ((uae_s64)a < 0)) rem = -rem;
+			SET_VFLG (0);
+			SET_CFLG (0);
+			SET_ZFLG (((uae_s32)quot) == 0);
+			SET_NFLG (((uae_s32)quot) < 0);
+			m68k_dreg(regs, extra & 7) = (uae_u32)rem;
+			m68k_dreg(regs, (extra >> 12) & 7) = (uae_u32)quot;
+		}
+	} else {
+		/* unsigned */
+		uae_u64 a = (uae_u64)(uae_u32)m68k_dreg(regs, (extra >> 12) & 7);
+		uae_u64 quot, rem;
+
+		if (extra & 0x400) {
+			a &= 0xffffffffu;
+			a |= (uae_u64)m68k_dreg(regs, extra & 7) << 32;
+		}
+		rem = a % (uae_u64)src;
+		quot = a / (uae_u64)src;
+		if (quot > 0xffffffffu) {
+			SET_VFLG (1);
+			SET_NFLG (1);
+			SET_CFLG (0);
+		} else {
+			SET_VFLG (0);
+			SET_CFLG (0);
+			SET_ZFLG (((uae_s32)quot) == 0);
+			SET_NFLG (((uae_s32)quot) < 0);
+			m68k_dreg(regs, extra & 7) = (uae_u32)rem;
+			m68k_dreg(regs, (extra >> 12) & 7) = (uae_u32)quot;
+		}
+	}
+#else
+	if (src == 0) {
+		Exception (5, oldpc);
+		return;
+	}
+	if (extra & 0x800) {
+		/* signed variant */
+		uae_s32 lo = (uae_s32)m68k_dreg(regs, (extra >> 12) & 7);
+		uae_s32 hi = lo < 0 ? -1 : 0;
+		uae_s32 save_high;
+		uae_u32 quot, rem;
+		uae_u32 sign;
+
+		if (extra & 0x400) {
+			hi = (uae_s32)m68k_dreg(regs, extra & 7);
+		}
+		save_high = hi;
+		sign = (hi ^ src);
+		if (hi < 0) {
+			hi = ~hi;
+			lo = -lo;
+			if (lo == 0) hi++;
+		}
+		if ((uae_s32)src < 0) src = -src;
+		if (div_unsigned(hi, lo, src, &quot, &rem) ||
+				(sign & 0x80000000) ? quot > 0x80000000 : quot > 0x7fffffff) {
+			SET_VFLG (1);
+			SET_NFLG (1);
+			SET_CFLG (0);
+		} else {
+			if (sign & 0x80000000) quot = -quot;
+			if (((uae_s32)rem < 0) != (save_high < 0)) rem = -rem;
+			SET_VFLG (0);
+			SET_CFLG (0);
+			SET_ZFLG (((uae_s32)quot) == 0);
+			SET_NFLG (((uae_s32)quot) < 0);
+			m68k_dreg(regs, extra & 7) = rem;
+			m68k_dreg(regs, (extra >> 12) & 7) = quot;
+		}
+	} else {
+		/* unsigned */
+		uae_u32 lo = (uae_u32)m68k_dreg(regs, (extra >> 12) & 7);
+		uae_u32 hi = 0;
+		uae_u32 quot, rem;
+
+		if (extra & 0x400) {
+			hi = (uae_u32)m68k_dreg(regs, extra & 7);
+		}
+		if (div_unsigned(hi, lo, src, &quot, &rem)) {
+			SET_VFLG (1);
+			SET_NFLG (1);
+			SET_CFLG (0);
+		} else {
+			SET_VFLG (0);
+			SET_CFLG (0);
+			SET_ZFLG (((uae_s32)quot) == 0);
+			SET_NFLG (((uae_s32)quot) < 0);
+			m68k_dreg(regs, extra & 7) = rem;
+			m68k_dreg(regs, (extra >> 12) & 7) = quot;
+		}
+	}
+#endif
+}
+
+#if !defined(uae_s64)
+static __inline__ void
+mul_unsigned(uae_u32 src1, uae_u32 src2, uae_u32 *dst_hi, uae_u32 *dst_lo)
+{
+	uae_u32 r0 = (src1 & 0xffff) * (src2 & 0xffff);
+	uae_u32 r1 = ((src1 >> 16) & 0xffff) * (src2 & 0xffff);
+	uae_u32 r2 = (src1 & 0xffff) * ((src2 >> 16) & 0xffff);
+	uae_u32 r3 = ((src1 >> 16) & 0xffff) * ((src2 >> 16) & 0xffff);
+	uae_u32 lo;
+
+	lo = r0 + ((r1 << 16) & 0xffff0000ul);
+	if (lo < r0) r3++;
+	r0 = lo;
+	lo = r0 + ((r2 << 16) & 0xffff0000ul);
+	if (lo < r0) r3++;
+	r3 += ((r1 >> 16) & 0xffff) + ((r2 >> 16) & 0xffff);
+	*dst_lo = lo;
+	*dst_hi = r3;
+}
+#endif
+
+void m68k_mull (uae_u32 opcode, uae_u32 src, uae_u16 extra)
+{
+#if defined(uae_s64)
+	if (extra & 0x800) {
+		/* signed variant */
+		uae_s64 a = (uae_s64)(uae_s32)m68k_dreg(regs, (extra >> 12) & 7);
+
+		a *= (uae_s64)(uae_s32)src;
+		SET_VFLG (0);
+		SET_CFLG (0);
+		SET_ZFLG (a == 0);
+		SET_NFLG (a < 0);
+		if (extra & 0x400)
+			m68k_dreg(regs, extra & 7) = a >> 32;
+		else if ((a & UVAL64(0xffffffff80000000)) != 0
+				 && (a & UVAL64(0xffffffff80000000)) != UVAL64(0xffffffff80000000))
+		{
+			SET_VFLG (1);
+		}
+		m68k_dreg(regs, (extra >> 12) & 7) = (uae_u32)a;
+	} else {
+		/* unsigned */
+		uae_u64 a = (uae_u64)(uae_u32)m68k_dreg(regs, (extra >> 12) & 7);
+
+		a *= (uae_u64)src;
+		SET_VFLG (0);
+		SET_CFLG (0);
+		SET_ZFLG (a == 0);
+		SET_NFLG (((uae_s64)a) < 0);
+		if (extra & 0x400)
+			m68k_dreg(regs, extra & 7) = a >> 32;
+		else if ((a & UVAL64(0xffffffff00000000)) != 0) {
+			SET_VFLG (1);
+		}
+		m68k_dreg(regs, (extra >> 12) & 7) = (uae_u32)a;
+	}
+#else
+	if (extra & 0x800) {
+		/* signed variant */
+		uae_s32 src1,src2;
+		uae_u32 dst_lo,dst_hi;
+		uae_u32 sign;
+
+		src1 = (uae_s32)src;
+		src2 = (uae_s32)m68k_dreg(regs, (extra >> 12) & 7);
+		sign = (src1 ^ src2);
+		if (src1 < 0) src1 = -src1;
+		if (src2 < 0) src2 = -src2;
+		mul_unsigned((uae_u32)src1,(uae_u32)src2,&dst_hi,&dst_lo);
+		if (sign & 0x80000000) {
+			dst_hi = ~dst_hi;
+			dst_lo = -dst_lo;
+			if (dst_lo == 0) dst_hi++;
+		}
+		SET_VFLG (0);
+		SET_CFLG (0);
+		SET_ZFLG (dst_hi == 0 && dst_lo == 0);
+		SET_NFLG (((uae_s32)dst_hi) < 0);
+		if (extra & 0x400)
+			m68k_dreg(regs, extra & 7) = dst_hi;
+		else if ((dst_hi != 0 || (dst_lo & 0x80000000) != 0)
+				 && ((dst_hi & 0xffffffff) != 0xffffffff
+					 || (dst_lo & 0x80000000) != 0x80000000))
+		{
+			SET_VFLG (1);
+		}
+		m68k_dreg(regs, (extra >> 12) & 7) = dst_lo;
+	} else {
+		/* unsigned */
+		uae_u32 dst_lo,dst_hi;
+
+		mul_unsigned(src,(uae_u32)m68k_dreg(regs, (extra >> 12) & 7),&dst_hi,&dst_lo);
+
+		SET_VFLG (0);
+		SET_CFLG (0);
+		SET_ZFLG (dst_hi == 0 && dst_lo == 0);
+		SET_NFLG (((uae_s32)dst_hi) < 0);
+		if (extra & 0x400)
+			m68k_dreg(regs, extra & 7) = dst_hi;
+		else if (dst_hi != 0) {
+			SET_VFLG (1);
+		}
+		m68k_dreg(regs, (extra >> 12) & 7) = dst_lo;
+	}
+#endif
+}
+static const char* ccnames[] =
+{ "T ","F ","HI","LS","CC","CS","NE","EQ",
+  "VC","VS","PL","MI","GE","LT","GT","LE" };
+
+// If value is greater than zero, this means we are still processing an EmulOp
+// because the counter is incremented only in m68k_execute(), i.e. interpretive
+// execution only
+static int m68k_execute_depth = 0;
+
+void m68k_reset (void)
+{
+	m68k_areg (regs, 7) = 0x2000;
+	m68k_setpc (ROMBaseMac + 0x2a);
+	fill_prefetch_0 ();
+	regs.s = 1;
+	regs.m = 0;
+	regs.stopped = 0;
+	regs.t1 = 0;
+	regs.t0 = 0;
+	SET_ZFLG (0);
+	SET_XFLG (0);
+	SET_CFLG (0);
+	SET_VFLG (0);
+	SET_NFLG (0);
+	SPCFLAGS_INIT( 0 );
+	regs.intmask = 7;
+	regs.vbr = regs.sfc = regs.dfc = 0;
+	fpu_reset();
+
+#if FLIGHT_RECORDER
+	log_ptr = 0;
+	memset(log, 0, sizeof(log));
+#endif
+
+#if ENABLE_MON
+	static bool first_time = true;
+	if (first_time) {
+		first_time = false;
+		mon_add_command("regs", dump_regs, "regs                    Dump m68k emulator registers\n");
+#if FLIGHT_RECORDER
+		// Install "log" command in mon
+		mon_add_command("log", dump_log, "log                      Dump m68k emulation log\n");
+#endif
+	}
+#endif
+}
+
+void m68k_emulop_return(void)
+{
+	SPCFLAGS_SET( SPCFLAG_BRK );
+	quit_program = true;
+}
+
+void m68k_emulop(uae_u32 opcode)
+{
+	struct M68kRegisters r;
+	int i;
+
+	for (i=0; i<8; i++) {
+		r.d[i] = m68k_dreg(regs, i);
+		r.a[i] = m68k_areg(regs, i);
+	}
+	MakeSR();
+	r.sr = regs.sr;
+	EmulOp(opcode, &r);
+	for (i=0; i<8; i++) {
+		m68k_dreg(regs, i) = r.d[i];
+		m68k_areg(regs, i) = r.a[i];
+	}
+	regs.sr = r.sr;
+	MakeFromSR();
+}
+
+#if CPU_NATIVE_TRAP_DISPATCH
+/*
+ * Native A-line trap dispatch.
+ *
+ * For Toolbox traps the ROM dispatcher only saves D2/A2, reads the trap
+ * table entry, turns the exception frame into a return address and jumps to
+ * the routine (RTS, or RTD #4 for auto-pop traps). For OS traps it saves
+ * A2/D2/D1/A1 (and A0 unless trap bit 8 is set), calls the routine from the
+ * OS table and returns through a short epilogue that restores them and tests
+ * D0. Doing the prologue here skips the exception frame and ~10 68k
+ * instructions per call; OS routines still return into the ROM epilogue.
+ * This applies only while the line-A vector still reaches a dispatcher whose
+ * code matches this sequence exactly; a patched vector (a debugger, another
+ * ROM) takes the architectural exception path.
+ */
+static const uae_u16 kTrapDispatcher[] = {
+	0x2F0A, 0x2F02, 0x246F, 0x000A, 0x341A, 0x0C42, 0xA800, 0x6530,	// +00 save, fetch trap
+	0x0442, 0xAC00, 0x641A, 0x2F70, 0x25A0, 0x1E00, 0x0008, 0x2F4A,	// +10 Toolbox: entry
+	0x000C, 0x241F, 0x245F, 0x4E75, 0x0000, 0x0000, 0x0000, 0x0000,	// +20 return PC, RTS
+	0x2F70, 0x25A0, 0x0E00, 0x0008, 0x241F, 0x245F, 0x4E74, 0x0004,	// +30 auto-pop: RTD #4
+	0x2F01, 0x2F09, 0x3202, 0x2F4A, 0x0014, 0x0242, 0x0100, 0x6620,	// +40 OS: save, flags
+	0x1401, 0x2F08, 0x4EB0, 0x25A1, 0x0400, 0x205F, 0x225F, 0x221F,	// +50 save A0, JSR; +5A epilogue
+	0x241F, 0x245F, 0x4A40, 0x584F, 0x4E75, 0x0000, 0x0000, 0x0000,	// +60 restore, TST.W D0, RTS
+	0x1401, 0x4EB0, 0x2591, 0x225F, 0x221F, 0x241F, 0x245F, 0x4A40,	// +70 keep A0, JSR; +76 epilogue
+	0x584F, 0x4E75,
+};
+static const uae_u32 kOsEpilogueRestoreA0 = 0x5A;
+static const uae_u32 kOsEpilogueKeepA0 = 0x76;
+
+static uaecptr trap_vector_checked = 0;
+static bool trap_vector_native = false;
+
+static inline bool native_trap_dispatch_ok(void)
+{
+	const uaecptr vector = get_long(regs.vbr + 4 * 10);
+	if (vector != trap_vector_checked) {
+		trap_vector_checked = vector;
+		trap_vector_native = true;
+		for (unsigned i = 0; i < sizeof(kTrapDispatcher) / sizeof(kTrapDispatcher[0]); ++i) {
+			if (get_word(vector + 2 * i) != kTrapDispatcher[i]) {
+				trap_vector_native = false;
+				break;
+			}
+		}
+	}
+	// Exception entry would switch to the supervisor stack and clear T/M;
+	// the shortcut is exact only when those are already in that state.
+	return trap_vector_native && regs.s && !regs.m && !regs.t0 && !regs.t1;
+}
+#endif
+
+void REGPARAM2 op_illg (uae_u32 opcode)
+{
+	uaecptr pc = m68k_getpc ();
+
+	if ((opcode & 0xF000) == 0xA000) {
+#if CPU_TRAP_PROFILE
+		trap_profile_counts[opcode & 0x0fff]++;
+		if (opcode == 0xA829)
+			layer_selector_counts[m68k_dreg(regs, 0) & 0xff]++;
+#endif
+#if CPU_NATIVE_QD_ACCEL
+		if (QuickDrawAccelTryTrap((uint16)opcode))
+			return;
+#endif
+#if CPU_NATIVE_IS_LAYER
+		/*
+		 * LayerDispatch selector 2 (IsLayer) is the hottest A-line operation
+		 * in Speedometer's Color Tests.  System 7 implements it as a single
+		 * GrafPort marker test: port->txSize (offset 0x4a) == 0xdead.
+		 *
+		 * Pascal Toolbox ABI at trap entry:
+		 *   (A7)   = GrafPtr argument (long)
+		 *   4(A7)  = caller-owned Boolean result slot
+		 * The trap pops the argument and leaves the result for the caller.
+		 */
+		if (opcode == 0xA829 && (m68k_dreg(regs, 0) & 0xff) == 0x02) {
+			const uaecptr sp = m68k_areg(regs, 7);
+			if (sp <= RAMSize - 5) {
+				const uaecptr port = get_long(sp);
+				if (port == 0 || port <= RAMSize - 0x4c) {
+					const bool is_layer = port != 0 && get_word(port + 0x4a) == 0xdead;
+					put_byte(sp + 4, is_layer ? 1 : 0);
+					m68k_areg(regs, 7) = sp + 4;
+					m68k_incpc(2);
+					return;
+				}
+			}
+		}
+#endif
+#if CPU_NATIVE_TRAP_DISPATCH
+		if (native_trap_dispatch_ok() && !(opcode & 0x0800)) {
+			// OS trap: the stack, registers and CCR the ROM prologue leaves at
+			// its JSR, including the frame slot the epilogue skips and the
+			// return address it finally pops.
+			uaecptr sp = m68k_areg(regs, 7);
+			MakeSR();
+			put_long(sp - 4, pc + 2);
+			put_word(sp - 6, (pc >> 16) & 0xffff);
+			put_word(sp - 8, regs.sr);
+			put_long(sp - 12, m68k_areg(regs, 2));
+			put_long(sp - 16, m68k_dreg(regs, 2));
+			put_long(sp - 20, m68k_dreg(regs, 1));
+			put_long(sp - 24, m68k_areg(regs, 1));
+			sp -= 24;
+			const bool keep_a0 = (opcode & 0x0100) != 0;
+			uae_u32 flag_value;
+			if (!keep_a0) {
+				sp -= 4;
+				put_long(sp, m68k_areg(regs, 0));
+				flag_value = m68k_areg(regs, 0);		// MOVE.L A0,-(SP)
+			} else {
+				flag_value = (uae_u32)(uae_s32)(uae_s8)opcode;	// MOVE.B D1,D2
+			}
+			sp -= 4;
+			put_long(sp, trap_vector_checked + (keep_a0 ? kOsEpilogueKeepA0 : kOsEpilogueRestoreA0));
+			m68k_areg(regs, 7) = sp;
+			m68k_areg(regs, 2) = pc + 2;
+			m68k_dreg(regs, 1) = (m68k_dreg(regs, 1) & 0xffff0000) | (opcode & 0xffff);
+			m68k_dreg(regs, 2) = (m68k_dreg(regs, 2) & 0xffff0000) | (opcode & 0x01ff);
+			SET_NFLG(((uae_s32)flag_value) < 0);
+			SET_ZFLG(flag_value == 0);
+			SET_VFLG(0);
+			SET_CFLG(0);
+			m68k_setpc(get_long(0x0400 + (opcode & 0x00ff) * 4));
+			return;
+		}
+		if ((opcode & 0x0800) && native_trap_dispatch_ok()) {
+			// Same register, stack and CCR state as the ROM dispatcher leaves:
+			// the routine address from the trap table, the caller's return
+			// address pushed unless auto-pop, and flags from MOVE.L (SP)+,D2.
+			const uaecptr routine = get_long(0x0E00 + (opcode & 0x03FF) * 4);
+			if (!(opcode & 0x0400)) {
+				m68k_areg(regs, 7) -= 4;
+				put_long(m68k_areg(regs, 7), pc + 2);
+			}
+			const uae_u32 d2 = m68k_dreg(regs, 2);
+			SET_NFLG(((uae_s32)d2) < 0);
+			SET_ZFLG(d2 == 0);
+			SET_VFLG(0);
+			SET_CFLG(0);
+			m68k_setpc(routine);
+			return;
+		}
+#endif
+		Exception(0xA,0);
+		return;
+	}
+
+	if ((opcode & 0xF000) == 0xF000) {
+		Exception(0xB,0);
+		return;
+	}
+
+	write_log ("Illegal instruction: %04x at %08x\n", opcode, pc);
+#if USE_JIT && JIT_DEBUG
+	compiler_dumpstate();
+#endif
+
+	Exception (4,0);
+	return;
+}
+
+void mmu_op(uae_u32 opcode, uae_u16 extra)
+{
+	if ((opcode & 0xFE0) == 0x0500) {
+		/* PFLUSH */
+		mmusr = 0;
+	} else if ((opcode & 0x0FD8) == 0x548) {
+		/* PTEST */
+	} else
+		op_illg (opcode);
+}
+
+static int n_insns = 0, n_spcinsns = 0;
+
+static uaecptr last_trace_ad = 0;
+
+static void do_trace (void)
+{
+	if (regs.t0 && CPUType >= 2) {
+		uae_u16 opcode;
+		/* should also include TRAP, CHK, SR modification FPcc */
+		/* probably never used so why bother */
+		/* We can afford this to be inefficient... */
+		m68k_setpc (m68k_getpc ());
+		fill_prefetch_0 ();
+		opcode = get_word(m68k_getpc());
+		if (opcode == 0x4e72            /* RTE */
+				|| opcode == 0x4e74                 /* RTD */
+				|| opcode == 0x4e75                 /* RTS */
+				|| opcode == 0x4e77                 /* RTR */
+				|| opcode == 0x4e76                 /* TRAPV */
+				|| (opcode & 0xffc0) == 0x4e80      /* JSR */
+				|| (opcode & 0xffc0) == 0x4ec0      /* JMP */
+				|| (opcode & 0xff00) == 0x6100  /* BSR */
+				|| ((opcode & 0xf000) == 0x6000     /* Bcc */
+					&& cctrue((opcode >> 8) & 0xf))
+				|| ((opcode & 0xf0f0) == 0x5050 /* DBcc */
+					&& !cctrue((opcode >> 8) & 0xf)
+					&& (uae_s16)m68k_dreg(regs, opcode & 7) != 0))
+		{
+			last_trace_ad = m68k_getpc ();
+			SPCFLAGS_CLEAR( SPCFLAG_TRACE );
+			SPCFLAGS_SET( SPCFLAG_DOTRACE );
+		}
+	} else if (regs.t1) {
+		last_trace_ad = m68k_getpc ();
+		SPCFLAGS_CLEAR( SPCFLAG_TRACE );
+		SPCFLAGS_SET( SPCFLAG_DOTRACE );
+	}
+}
+
+int m68k_do_specialties (void)
+{
+#if USE_JIT
+	// Block was compiled
+	SPCFLAGS_CLEAR( SPCFLAG_JIT_END_COMPILE );
+
+	// Retain the request to get out of compiled code until
+	// we reached the toplevel execution, i.e. the one that
+	// can compile then run compiled code. This also means
+	// we processed all (nested) EmulOps
+	if ((m68k_execute_depth == 0) && SPCFLAGS_TEST( SPCFLAG_JIT_EXEC_RETURN ))
+		SPCFLAGS_CLEAR( SPCFLAG_JIT_EXEC_RETURN );
+#endif
+
+	if (SPCFLAGS_TEST( SPCFLAG_DOTRACE )) {
+		Exception (9,last_trace_ad);
+	}
+	while (SPCFLAGS_TEST( SPCFLAG_STOP )) {
+		if (__atomic_load_n(&boot_control_pending, __ATOMIC_ACQUIRE)) cpu_do_check_control();
+		if (SPCFLAGS_TEST( SPCFLAG_INT | SPCFLAG_DOINT )){
+			SPCFLAGS_CLEAR( SPCFLAG_INT | SPCFLAG_DOINT );
+			int intr = intlev ();
+			if (intr != -1 && intr > regs.intmask) {
+				Interrupt (intr);
+				regs.stopped = 0;
+				SPCFLAGS_CLEAR( SPCFLAG_STOP );
+			}
+		}
+	}
+	if (SPCFLAGS_TEST( SPCFLAG_TRACE ))
+		do_trace ();
+
+	if (SPCFLAGS_TEST( SPCFLAG_DOINT )) {
+		SPCFLAGS_CLEAR( SPCFLAG_DOINT );
+		int intr = intlev ();
+		if (intr != -1 && intr > regs.intmask) {
+			Interrupt (intr);
+			regs.stopped = 0;
+		}
+	}
+	if (SPCFLAGS_TEST( SPCFLAG_INT )) {
+		SPCFLAGS_CLEAR( SPCFLAG_INT );
+		SPCFLAGS_SET( SPCFLAG_DOINT );
+	}
+	if (SPCFLAGS_TEST( SPCFLAG_BRK )) {
+		SPCFLAGS_CLEAR( SPCFLAG_BRK );
+		return 1;
+	}
+	return 0;
+}
+
+// Place the main CPU execution loop in internal RAM for faster execution
+// This is the hottest path in the emulator - runs for every 68k instruction
+//
+// OPTIMIZATION: The inner loop executes multiple instructions before checking
+// for ticks and special flags. This reduces overhead significantly.
+// The BATCH_SIZE controls how many instructions run before checking - higher
+// values improve performance but reduce interrupt responsiveness.
+// Larger batches reduce loop bookkeeping overhead on the ESP32-P4.
+// Keep this moderate so periodic checks stay responsive.
+#define EXEC_BATCH_SIZE 8192
+
+// External tick counter (defined in main_esp32.cpp via newcpu.h)
+extern int32 emulated_ticks;
+extern void cpu_do_check_ticks(void);
+
+#ifdef ARDUINO
+IRAM_ATTR
+#endif
+void m68k_do_execute (void)
+{
+#if CPU_DEFER_DOINT_IN_BATCH
+	// Handle asynchronous IRQ (DOINT/INT) at batch boundaries to reduce hot-loop
+	// churn, while still handling BRK/TRACE/STOP immediately for correctness.
+	const spcflags_t inner_break_flags = SPCFLAG_BRK
+	                                   | SPCFLAG_TRACE
+	                                   | SPCFLAG_DOTRACE
+	                                   | SPCFLAG_STOP
+	                                   | SPCFLAG_JIT_END_COMPILE;
+#if defined(ARDUINO_ARCH_ESP32) || defined(ESP32)
+#define CPU_INNER_SPECIAL_PENDING() (spcflags_urgent != 0)
+#else
+#define CPU_INNER_SPECIAL_PENDING() (__atomic_load_n(&regs.spcflags, __ATOMIC_RELAXED) & inner_break_flags)
+#endif
+#else
+	const spcflags_t inner_break_flags = SPCFLAG_ALL_BUT_EXEC_RETURN;
+#define CPU_INNER_SPECIAL_PENDING() (SPCFLAGS_TEST(inner_break_flags))
+#endif
+		for (;;) {
+			// Execute a batch of instructions before checking ticks/flags.
+			int batch_count = EXEC_BATCH_SIZE;
+			bool special_hit = false;
+
+		// Keep local copies of dispatch structures in this hot loop.
+		cpuop_func **const tbl = cpufunctbl;
+#if CPU_COMPACT_DISPATCH
+		uae_u16 *const compact_index = compact_dispatch_index;
+		cpuop_func **const compact_handlers = compact_dispatch_handlers;
+#endif
+
+#if USE_RV32_JIT
+		// Execute already-translated blocks at the current PC before falling
+		// through to one interpreter instruction on a cache miss. The miss path
+		// also attempts compilation, so hot code promotes itself naturally.
+		while (batch_count > 0) {
+			int jit_n = jit_try_execute(m68k_getpc());
+			if (jit_n <= 0) break;
+			batch_count -= jit_n;
+			if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+				special_hit = true;
+				break;
+			}
+		}
+			if (!special_hit && batch_count > 0) {
+#endif
+
+#if CPU_TRACE_CACHE
+			while (batch_count >= CPU_TRACE_LENGTH) {
+				const int executed = cpu_trace_execute(tbl);
+				batch_count -= executed;
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+					special_hit = true;
+					break;
+				}
+			}
+			while (!special_hit && batch_count-- > 0) {
+				const uae_u32 opcode = GET_OPCODE;
+				(*tbl[opcode])(opcode);
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+					special_hit = true;
+					break;
+				}
+			}
+#else
+#if CPU_COMPACT_DISPATCH
+		if (unlikely(compact_index != NULL && compact_handlers != NULL)) {
+#if FLIGHT_RECORDER
+#define CPU_COMPACT_RECORD() m68k_record_step(m68k_getpc())
+#else
+#define CPU_COMPACT_RECORD() do { } while (0)
+#endif
+#define CPU_COMPACT_EXEC_ONE() do { \
+	uae_u32 opcode = GET_OPCODE; \
+	CPU_COMPACT_RECORD(); \
+	(*compact_handlers[compact_index[opcode]])(opcode); \
+} while (0)
+			// Poll urgent flags once per 8 dispatched instructions.
+			while (batch_count >= 8) {
+				CPU_COMPACT_EXEC_ONE();
+				CPU_COMPACT_EXEC_ONE();
+				CPU_COMPACT_EXEC_ONE();
+				CPU_COMPACT_EXEC_ONE();
+				CPU_COMPACT_EXEC_ONE();
+				CPU_COMPACT_EXEC_ONE();
+				CPU_COMPACT_EXEC_ONE();
+				CPU_COMPACT_EXEC_ONE();
+				batch_count -= 8;
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+					special_hit = true;
+					break;
+				}
+			}
+
+			while (!special_hit && batch_count >= 4) {
+				CPU_COMPACT_EXEC_ONE();
+				CPU_COMPACT_EXEC_ONE();
+				CPU_COMPACT_EXEC_ONE();
+				CPU_COMPACT_EXEC_ONE();
+				batch_count -= 4;
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+					special_hit = true;
+					break;
+				}
+			}
+
+			while (!special_hit && batch_count-- > 0) {
+				CPU_COMPACT_EXEC_ONE();
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+					special_hit = true;
+					break;
+				}
+			}
+#undef CPU_COMPACT_EXEC_ONE
+#undef CPU_COMPACT_RECORD
+		} else
+#endif
+		{
+			// Poll urgent flags once per 8 dispatched instructions.
+			while (batch_count >= 8) {
+				uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+				batch_count -= 8;
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+					special_hit = true;
+					break;
+				}
+			}
+
+			while (!special_hit && batch_count >= 4) {
+				uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+
+				opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+				m68k_record_step(m68k_getpc());
+#endif
+				(*tbl[opcode])(opcode);
+				batch_count -= 4;
+				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+					special_hit = true;
+					break;
+				}
+			}
+
+				while (!special_hit && batch_count-- > 0) {
+					uae_u32 opcode = GET_OPCODE;
+#if FLIGHT_RECORDER
+					m68k_record_step(m68k_getpc());
+#endif
+					(*tbl[opcode])(opcode);
+					if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
+						special_hit = true;
+						break;
+				}
+			}
+			}
+#endif // CPU_TRACE_CACHE
+#if USE_RV32_JIT
+		}
+#endif
+
+			// batch_count may be -1 when the scalar loop exits after final iteration.
+			const int instructions_executed =
+				EXEC_BATCH_SIZE - ((batch_count > 0) ? batch_count : 0);
+
+#if CPU_CORE_PROFILE
+			cpu_prof_batches++;
+		cpu_prof_instructions += instructions_executed;
+		if (special_hit) {
+			cpu_prof_special_breaks++;
+			spcflags_t flags = __atomic_load_n(&regs.spcflags, __ATOMIC_RELAXED);
+			if (flags & SPCFLAG_INT) cpu_prof_flag_int++;
+			if (flags & SPCFLAG_DOINT) cpu_prof_flag_doint++;
+			if (flags & SPCFLAG_BRK) cpu_prof_flag_brk++;
+			if (flags & (SPCFLAG_TRACE | SPCFLAG_DOTRACE)) cpu_prof_flag_trace++;
+			if (flags & SPCFLAG_STOP) cpu_prof_flag_stop++;
+		}
+#endif
+		
+		// Decrement tick counter by number of instructions actually executed
+		// This maintains accurate instruction counting for IPS monitoring
+		if (__atomic_load_n(&boot_control_pending, __ATOMIC_ACQUIRE)) cpu_do_check_control();
+		emulated_ticks -= instructions_executed;
+			if (emulated_ticks <= 0) {
+#if CPU_CORE_PROFILE
+				cpu_prof_tick_checks++;
+#endif
+				cpu_do_check_ticks();
+			}
+
+			// Handle special conditions (interrupts, trace, etc.)
+			if (SPCFLAGS_TEST(SPCFLAG_ALL_BUT_EXEC_RETURN)) {
+#if CPU_CORE_PROFILE
+			cpu_prof_special_calls++;
+#endif
+			if (m68k_do_specialties())
+				return;
+		}
+	}
+
+#undef CPU_INNER_SPECIAL_PENDING
+}
+
+void reportCPUCorePerf(uint32 current_time_ms)
+{
+#if !CPU_CORE_PROFILE
+	UNUSED(current_time_ms);
+	return;
+#else
+	const uint32 interval_ms = 5000;
+	if (current_time_ms - cpu_prof_last_report_ms < interval_ms) {
+		return;
+	}
+	cpu_prof_last_report_ms = current_time_ms;
+
+	uint64_t batches = cpu_prof_batches;
+	uint64_t instructions = cpu_prof_instructions;
+	uint64_t special_breaks = cpu_prof_special_breaks;
+	uint64_t tick_checks = cpu_prof_tick_checks;
+	uint64_t special_calls = cpu_prof_special_calls;
+	uint64_t flag_int = cpu_prof_flag_int;
+	uint64_t flag_doint = cpu_prof_flag_doint;
+	uint64_t flag_brk = cpu_prof_flag_brk;
+	uint64_t flag_trace = cpu_prof_flag_trace;
+	uint64_t flag_stop = cpu_prof_flag_stop;
+
+	if (batches > 0) {
+#ifdef ARDUINO
+		Serial.printf("[CPU PERF] batches=%llu avg_instr_per_batch=%.1f special_breaks=%llu tick_checks=%llu specialties=%llu flags(INT=%llu DOINT=%llu BRK=%llu TRACE=%llu STOP=%llu)\n",
+		              batches,
+		              (double)instructions / (double)batches,
+		              special_breaks,
+		              tick_checks,
+		              special_calls,
+		              flag_int,
+		              flag_doint,
+		              flag_brk,
+		              flag_trace,
+		              flag_stop);
+#endif
+	}
+
+	cpu_prof_batches = 0;
+	cpu_prof_instructions = 0;
+	cpu_prof_special_breaks = 0;
+	cpu_prof_tick_checks = 0;
+	cpu_prof_special_calls = 0;
+	cpu_prof_flag_int = 0;
+	cpu_prof_flag_doint = 0;
+	cpu_prof_flag_brk = 0;
+	cpu_prof_flag_trace = 0;
+	cpu_prof_flag_stop = 0;
+#endif
+}
+
+void m68k_execute (void)
+{
+#if USE_JIT
+	++m68k_execute_depth;
+#endif
+	for (;;) {
+		if (quit_program)
+			break;
+		m68k_do_execute();
+	}
+#if USE_JIT
+	--m68k_execute_depth;
+#endif
+}
+
+static void m68k_verify (uaecptr addr, uaecptr *nextpc)
+{
+	uae_u32 opcode, val;
+	struct instr *dp;
+
+	opcode = get_iword_1(0);
+	last_op_for_exception_3 = opcode;
+	m68kpc_offset = 2;
+
+	if (cpufunctbl[cft_map(opcode)] == op_illg_1) {
+		opcode = 0x4AFC;
+	}
+	dp = table68k + opcode;
+
+	if (dp->suse) {
+		if (!verify_ea (dp->sreg, (amodes)dp->smode, (wordsizes)dp->size, &val)) {
+			Exception (3, 0);
+			return;
+		}
+	}
+	if (dp->duse) {
+		if (!verify_ea (dp->dreg, (amodes)dp->dmode, (wordsizes)dp->size, &val)) {
+			Exception (3, 0);
+			return;
+		}
+	}
+}
+
+void m68k_disasm (uaecptr addr, uaecptr *nextpc, int cnt)
+{
+	uaecptr newpc = 0;
+	m68kpc_offset = addr - m68k_getpc ();
+	while (cnt-- > 0) {
+		char instrname[20],*ccpt;
+		int opwords;
+		uae_u32 opcode;
+		struct mnemolookup *lookup;
+		struct instr *dp;
+		printf ("%08lx: ", m68k_getpc () + m68kpc_offset);
+		for (opwords = 0; opwords < 5; opwords++){
+			printf ("%04x ", get_iword_1 (m68kpc_offset + opwords*2));
+		}
+		opcode = get_iword_1 (m68kpc_offset);
+		m68kpc_offset += 2;
+		if (cpufunctbl[cft_map(opcode)] == op_illg_1) {
+			opcode = 0x4AFC;
+		}
+		dp = table68k + opcode;
+		for (lookup = lookuptab;lookup->mnemo != dp->mnemo; lookup++)
+			;
+
+		strcpy (instrname, lookup->name);
+		ccpt = strstr (instrname, "cc");
+		if (ccpt != 0) {
+			strncpy (ccpt, ccnames[dp->cc], 2);
+		}
+		printf ("%s", instrname);
+		switch (dp->size){
+		case sz_byte: printf (".B "); break;
+		case sz_word: printf (".W "); break;
+		case sz_long: printf (".L "); break;
+		default: printf ("   "); break;
+		}
+
+		if (dp->suse) {
+			newpc = m68k_getpc () + m68kpc_offset;
+			newpc += ShowEA (dp->sreg, (amodes)dp->smode, (wordsizes)dp->size, 0);
+		}
+		if (dp->suse && dp->duse)
+			printf (",");
+		if (dp->duse) {
+			newpc = m68k_getpc () + m68kpc_offset;
+			newpc += ShowEA (dp->dreg, (amodes)dp->dmode, (wordsizes)dp->size, 0);
+		}
+		if (ccpt != 0) {
+			if (cctrue(dp->cc))
+				printf (" == %08x (TRUE)", newpc);
+			else
+				printf (" == %08x (FALSE)", newpc);
+		} else if ((opcode & 0xff00) == 0x6100) /* BSR */
+			printf (" == %08x", newpc);
+		printf ("\n");
+	}
+	if (nextpc)
+		*nextpc = m68k_getpc () + m68kpc_offset;
+}
+
+void m68k_dumpstate (uaecptr *nextpc)
+{
+	int i;
+	for (i = 0; i < 8; i++){
+		printf ("D%d: %08x ", i, m68k_dreg(regs, i));
+		if ((i & 3) == 3) printf ("\n");
+	}
+	for (i = 0; i < 8; i++){
+		printf ("A%d: %08x ", i, m68k_areg(regs, i));
+		if ((i & 3) == 3) printf ("\n");
+	}
+	if (regs.s == 0) regs.usp = m68k_areg(regs, 7);
+	if (regs.s && regs.m) regs.msp = m68k_areg(regs, 7);
+	if (regs.s && regs.m == 0) regs.isp = m68k_areg(regs, 7);
+	printf ("USP=%08x ISP=%08x MSP=%08x VBR=%08x\n",
+			regs.usp,regs.isp,regs.msp,regs.vbr);
+	printf ("T=%d%d S=%d M=%d X=%ld N=%ld Z=%ld V=%ld C=%ld IMASK=%d\n",
+			regs.t1, regs.t0, regs.s, regs.m,
+			GET_XFLG, GET_NFLG, GET_ZFLG, GET_VFLG, GET_CFLG, regs.intmask);
+
+	fpu_dump_registers();
+	fpu_dump_flags();
+
+	m68k_disasm(m68k_getpc (), nextpc, 1);
+	if (nextpc)
+		printf ("next PC: %08x\n", *nextpc);
+}

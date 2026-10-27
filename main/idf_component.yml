@@ -1,0 +1,4 @@
+dependencies:
+  idf: ">=6.1.0"
+  espressif/esp32_s31_korvo_1_noglib: "=1.0.1"
+  espressif/arduino-esp32: "=4.0.0-rc1"
