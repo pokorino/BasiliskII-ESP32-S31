@@ -12,6 +12,22 @@ Audio codec initialization appeared in the log, but audible output was not teste
 
 The application has no wireless configuration and does not deliberately start Wi-Fi, Bluetooth, or IEEE 802.15.4 radios. Some ESP-IDF dependencies include wireless-related components; this is not an RF certification or a radio-emission measurement.
 
+## Hardware photos
+
+Photos of the tested ESP32-S31-Korvo-1 and attached LCD, provided by pokorino LABO.
+
+Mac OS 8.1 desktop and About This Computer showing 12 MB of emulated RAM:
+
+![Mac OS 8.1 desktop on the ESP32-S31 LCD](docs/images/mac-os-81-desktop.jpg)
+
+The settings screen:
+
+![Basilisk II settings screen on the ESP32-S31 LCD](docs/images/settings-screen.jpg)
+
+Mac OS during startup:
+
+![Mac OS startup screen on the ESP32-S31 LCD](docs/images/mac-os-startup.jpg)
+
 ## Quick start: Windows x64
 
 [日本語の導入手順](docs/WINDOWS-JA.md)
