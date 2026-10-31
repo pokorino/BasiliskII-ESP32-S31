@@ -10,3 +10,4 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # The 68k interpreter owns core 1 continuously. Keep idle monitoring on core 0.
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+CONFIG_FATFS_LFN_HEAP=y

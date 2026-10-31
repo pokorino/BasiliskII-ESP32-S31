@@ -24,11 +24,10 @@ static esp_err_t init_display(void)
                                                          (void **)&panel_fb),
                         TAG, "LCD framebuffer");
     if (!panel_fb) return ESP_FAIL;
-    /* RGB panel is native 800x480 landscape. Show a test card until the
-     * emulator's first frame arrives. Keep this buffer off the app stack. */
+    /* Keep the panel black while waiting for a settings shortcut. */
     static uint16_t line[800];
     for (size_t y = 0; y < 480; ++y) {
-        const uint16_t color = y < 160 ? 0x001fu : y < 320 ? 0x07e0u : 0xf800u;
+        const uint16_t color = 0x0000u;
         for (size_t x = 0; x < 800; ++x) line[x] = color;
         ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(panel, 0, (int)y,
                                                      800, (int)y + 1, line),

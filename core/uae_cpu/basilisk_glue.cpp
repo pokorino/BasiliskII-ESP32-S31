@@ -64,6 +64,14 @@ bool UseJIT = false;
 
 // From newcpu.cpp
 extern bool quit_program;
+static bool s31_shutdown_requested = false;
+
+void Request680x0Shutdown(void)
+{
+    s31_shutdown_requested = true;
+    m68k_emulop_return();
+}
+
 
 #ifndef CPU_FORCE_PSRAM_DISPATCH
 #define CPU_FORCE_PSRAM_DISPATCH 0
@@ -205,6 +213,7 @@ void InitFrameBufferMapping(void)
 
 void Start680x0(void)
 {
+	s31_shutdown_requested = false;
 	m68k_reset();
 #if USE_JIT
     if (UseJIT)
@@ -287,7 +296,8 @@ void Execute68kTrap(uint16 trap, struct M68kRegisters *r)
 		r->d[i] = m68k_dreg(regs, i);
 	for (i=0; i<7; i++)
 		r->a[i] = m68k_areg(regs, i);
-	quit_program = false;
+	if (s31_shutdown_requested) m68k_emulop_return();
+	else quit_program = false;
 }
 
 
@@ -334,5 +344,6 @@ void Execute68k(uint32 addr, struct M68kRegisters *r)
 		r->d[i] = m68k_dreg(regs, i);
 	for (i=0; i<7; i++)
 		r->a[i] = m68k_areg(regs, i);
-	quit_program = false;
+	if (s31_shutdown_requested) m68k_emulop_return();
+	else quit_program = false;
 }

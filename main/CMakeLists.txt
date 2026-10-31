@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c" "s31_video.c" "s31_platform.cpp" "s31_input_board.cpp" "s31_cpu_selftest.cpp" "s31_flash_storage.c" "s31_remote_input.cpp"
+    SRCS "main.c" "s31_video.c" "s31_platform.cpp" "s31_input_board.cpp" "s31_settings.cpp" "s31_cpu_selftest.cpp" "s31_flash_storage.c" "s31_remote_input.cpp"
          "../core/main.cpp"
          "../core/main_esp32.cpp"
          "../core/video.cpp"

@@ -8,6 +8,7 @@
 #include "automation.h"
 #include "touch_overlay.h"
 #include "esp_system.h"
+#include "s31_settings.h"
 
 static fs::FSImplPtr sd_impl(new VFSImpl());
 fs::FS S31SD(sd_impl);
@@ -33,18 +34,18 @@ const char *BootGUI_GetDiskPath() {
 #if S31_FLASH_BOOT
     return "/SYS70.DSK";
 #else
-    return "/Macintosh8.dsk";
+    return S31SettingsDisk();
 #endif
 }
 const char *BootGUI_GetCDROMPath() { return ""; }
 const char *BootGUI_GetExtFSPath() { return ""; }
-uint32_t BootGUI_GetRAMSize() { return 8u * 1024u * 1024u; }
-int BootGUI_GetRAMSizeMB() { return 8; }
+uint32_t BootGUI_GetRAMSize() { return (uint32_t)S31SettingsRAM() * 1024u * 1024u; }
+int BootGUI_GetRAMSizeMB() { return S31SettingsRAM(); }
 bool BootGUI_GetAudioEnabled() {
 #if S31_EMU_NO_IO
     return false;
 #else
-    return true;
+    return S31SettingsAudio();
 #endif
 }
 bool BootGUI_GetBootFromCD() { return false; }
@@ -70,6 +71,7 @@ static void emulator_task(void *) {
     initArduino();
     Serial.begin(115200);
     S31FilesystemInit();
+    S31SettingsBoot();
     basilisk_setup();
     vTaskDelete(nullptr);
 }

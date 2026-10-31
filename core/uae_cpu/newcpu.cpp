@@ -279,8 +279,11 @@ static bool build_compact_dispatch(void)
 	}
 	memset(hash_tbl, 0, hash_size * sizeof(hash_entry));
 
+	// At most one distinct handler can occupy each hash slot. Allocating
+	// one pointer per opcode needlessly consumes 256 KiB and can fail on
+	// 12 MiB guest configurations even when fewer than 2,000 are needed.
 	cpuop_func **tmp_handlers = (cpuop_func **)heap_caps_malloc(
-		opcode_count * sizeof(cpuop_func *),
+		hash_size * sizeof(cpuop_func *),
 		MALLOC_CAP_SPIRAM
 	);
 	if (tmp_handlers == NULL) {
@@ -298,7 +301,7 @@ static bool build_compact_dispatch(void)
 		for (;;) {
 			hash_entry *entry = &hash_tbl[slot];
 				if (entry->key == 0) {
-					if (unique_count == 0xFFFF) {
+					if (unique_count >= hash_size) {
 						heap_caps_free(tmp_handlers);
 						heap_caps_free(hash_tbl);
 						write_log("Flat compact dispatch: too many unique handlers (%u)\n", unique_count);
@@ -2007,6 +2010,7 @@ void m68k_do_execute (void)
 			while (!special_hit && batch_count-- > 0) {
 				const uae_u32 opcode = GET_OPCODE;
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
 					special_hit = true;
 					break;
@@ -2024,6 +2028,7 @@ void m68k_do_execute (void)
 	uae_u32 opcode = GET_OPCODE; \
 	CPU_COMPACT_RECORD(); \
 	(*compact_handlers[compact_index[opcode]])(opcode); \
+	if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; } \
 } while (0)
 			// Poll urgent flags once per 8 dispatched instructions.
 			while (batch_count >= 8) {
@@ -2073,48 +2078,56 @@ void m68k_do_execute (void)
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 				batch_count -= 8;
 				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
 					special_hit = true;
@@ -2128,24 +2141,28 @@ void m68k_do_execute (void)
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 
 				opcode = GET_OPCODE;
 #if FLIGHT_RECORDER
 				m68k_record_step(m68k_getpc());
 #endif
 				(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 				batch_count -= 4;
 				if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
 					special_hit = true;
@@ -2159,6 +2176,7 @@ void m68k_do_execute (void)
 					m68k_record_step(m68k_getpc());
 #endif
 					(*tbl[opcode])(opcode);
+				if (unlikely(quit_program)) { SPCFLAGS_CLEAR(SPCFLAG_BRK); return; }
 					if (unlikely(CPU_INNER_SPECIAL_PENDING())) {
 						special_hit = true;
 						break;

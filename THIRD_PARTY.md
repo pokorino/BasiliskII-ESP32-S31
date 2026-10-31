@@ -1,20 +1,12 @@
-# Upstream and attribution
+# Credits, source and licenses
 
-This experimental S31 port was adapted from the local ESP32-P4 port based on:
+- **Basilisk II** was originally written by Christian Bauer and maintained by its contributors. Upstream: <https://github.com/cebix/macemu>. The project retains the per-file copyright and license notices; the GNU GPL version 2 text is in [LICENSE](LICENSE). Files that specify GPL-2.0-or-later retain that option.
+- **UAE 68k CPU emulation** includes work by Bernd Schmidt and contributors, as credited in the source files.
+- The local ESP32-P4 port used as a starting point derives from [amcchord/M5Tab-Macintosh](https://github.com/amcchord/M5Tab-Macintosh). Thank you to amcchord and the P4 port contributors. The exact upstream commit of the local P4 snapshot was not recorded; this repository does not claim an exact upstream revision.
+- The settings and on-screen overlay font bitmap in `main/chicago_font_data.h` is generated from **DejaVu Sans**. The unmodified TTF and its full copyright/permission notices are included in [assets/fonts](assets/fonts/DejaVu-LICENSE.txt). DejaVu changes are public domain; the font also includes Bitstream Vera and Arev copyright/permission notices as stated in that file. The internal `Chicago` identifiers are historical code names, not a claim that the font is Apple's Chicago.
+- An earlier published preview included bitmap glyphs derived from **Pix Chicago** by Etienne Desclides. The [font listing](https://www.dafont.com/pix-chicago.font) labels it 100% free, but a detailed redistribution license was not found. This release replaces those glyphs with DejaVu Sans; earlier Git history has not been rewritten.
+- ESP-IDF, Arduino-ESP32, the ESP32-S31-Korvo-1 BSP and the other components identified in `dependencies.lock` retain their own licenses and notices. They are fetched or supplied as build dependencies and are not covered by a blanket claim that every dependency uses the project's GPL terms. For the exact releases consult their component package source and included license files.
+- The tested ESP-IDF source is [commit fff9895c82d744c7237be8847347bdd1b07c6643](https://github.com/espressif/esp-idf/tree/fff9895c82d744c7237be8847347bdd1b07c6643). The locked Arduino-ESP32 package identifies [commit 71a695b76cb80214104ef8a55b9da950013a4dcd](https://github.com/espressif/arduino-esp32/tree/71a695b76cb80214104ef8a55b9da950013a4dcd) and LGPL-2.1. The locked ESP32-S31-Korvo-1 no-graphics BSP is `espressif/esp32_s31_korvo_1_noglib` 1.0.1, available via the ESP Component Registry.
+- The Windows release bundles **esptool 5.6.0** by Espressif Systems and contributors under GPL-2.0-or-later. The corresponding tool source is <https://github.com/espressif/esptool/tree/v5.6.0>, and the full GPL v2 text is included as `LICENSE-GPL-2.0.txt` in the package. The official standalone archive also bundles Python and other dependencies; see their respective notices and source via the upstream project and release.
 
-- [amcchord/M5Tab-Macintosh](https://github.com/amcchord/M5Tab-Macintosh),
-  the ESP32-P4 BasiliskII port. The exact upstream source commit was not recorded
-  in the local source snapshot.
-- [BasiliskII / macemu](https://github.com/cebix/macemu), originally by
-  Christian Bauer and contributors.
-- UAE CPU emulation, including Bernd Schmidt and contributors, as identified
-  in the source file notices.
-
-The original per-file copyright and license notices remain in the source tree.
-The GPL version 2 text in LICENSE is taken from the BasiliskII COPYING file at:
-https://github.com/cebix/macemu/blob/master/BasiliskII/COPYING
-Files specifying GPL version 2 or later retain that choice; other per-file
-notices remain applicable.
-
-Dependencies are fetched by ESP-IDF Component Manager, not vendored in this
-public source package. Their own copyright and license notices apply.
+No Macintosh ROM, Mac OS software, or user disk image is distributed. Users must supply their own appropriately licensed copies.

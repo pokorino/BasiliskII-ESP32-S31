@@ -398,10 +398,12 @@ bool ChoiceAlert(const char *text, const char *pos, const char *neg)
 /*
  *  Quit emulator
  */
+extern void Request680x0Shutdown(void);
 void QuitEmulator(void)
 {
     Serial.println("[MAIN] QuitEmulator called");
     emulator_running = false;
+    Request680x0Shutdown();
 }
 
 /*
@@ -556,7 +558,11 @@ static bool InitEmulator(void)
     // Load ROM file
     const char *rom_path = PrefsFindString("rom");
     if (!rom_path) {
+#if S31_FLASH_BOOT
         rom_path = "/Q650.ROM";
+#else
+        rom_path = "/MAC_ROM.dat";
+#endif
     }
     
     if (!LoadROM(rom_path)) {
@@ -675,7 +681,23 @@ void basilisk_setup(void)
     ExitAll();
     SysExit();
     PrefsExit();
-    
+
+    // VideoExit has stopped the renderer. Clear the physical display only
+    // after disk and subsystem cleanup, so no partial desktop remains.
+    static const uint16_t black_tile[32 * 8] = {};
+    const int width = BoardDisplay_Width(), height = BoardDisplay_Height();
+    bool cleared = BoardDisplay_BeginTiles();
+    if (cleared) {
+        for (int y = 0; y < height; y += 8) {
+            const int h = (height - y < 8) ? height - y : 8;
+            for (int x = 0; x < width; x += 32) {
+                const int w = (width - x < 32) ? width - x : 32;
+                if (!BoardDisplay_PushTile(x, y, w, h, black_tile)) cleared = false;
+            }
+        }
+        if (!BoardDisplay_EndTiles()) cleared = false;
+    }
+    Serial.printf("[MAIN] Shutdown display clear: %s\n", cleared ? "ok" : "failed");
     Serial.println("[MAIN] BasiliskII shutdown complete");
 }
 

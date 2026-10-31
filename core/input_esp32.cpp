@@ -353,6 +353,13 @@ struct UsbDeviceSlot {
 // Forward declarations
 class MultiDeviceUsbHost;
 static MultiDeviceUsbHost *usbHost = NULL;
+static bool s31_boot_usb_mode = false;
+static bool s31_boot_suppress_held = false;
+static bool s31_boot_keys[256] = {};
+static uint8_t s31_boot_key_event = 0;
+static uint8_t s31_boot_modifiers = 0;
+static int s31_mouse_dx = 0, s31_mouse_dy = 0;
+static uint8_t s31_mouse_buttons = 0;
 
 // ============================================================================
 // Keyboard Input Processing
@@ -607,7 +614,6 @@ static void processMouseReport(const usb_transfer_t *transfer, EndpointInfo *ep_
     if (transfer->actual_num_bytes < 3) return;
 
     mouse_connected = true;
-
     uint8_t buttons = 0;
     int16_t dx = 0;
     int16_t dy = 0;
@@ -621,7 +627,12 @@ static void processMouseReport(const usb_transfer_t *transfer, EndpointInfo *ep_
      * fallback for vintage boot-mode mice and devices whose report
      * descriptor is unusual enough that the parser bails. */
     bool layout_decoded = false;
-    if (layout != NULL && layout->valid) {
+    // Boot protocol mice use a three-byte buttons/X/Y report. A composite
+    // receiver can expose another HID interface whose descriptor has a
+    // different report ID and length; do not apply that layout here.
+    bool boot_mouse_packet = ep_info->bInterfaceSubClass == HID_SUBCLASS_BOOT &&
+        ep_info->bInterfaceProtocol == 2 /* HID boot mouse */ && transfer->actual_num_bytes == 3;
+    if (!boot_mouse_packet && layout != NULL && layout->valid) {
         layout_decoded = HidDecodeMouseReport(transfer->data_buffer,
                                               transfer->actual_num_bytes,
                                               layout, &buttons, &dx, &dy, &dw);
@@ -657,6 +668,10 @@ static void processMouseReport(const usb_transfer_t *transfer, EndpointInfo *ep_
         }
     }
 
+    if (s31_boot_usb_mode) {
+        s31_mouse_dx += dx; s31_mouse_dy += dy; s31_mouse_buttons = buttons;
+        return;
+    }
     uint8_t old_buttons = usb_mouse_buttons;
 
     // Mac OS 8 right-click -> Control+Click translation.
@@ -1003,7 +1018,13 @@ private:
 
         Serial.printf("[USB] Device %d disconnected\n", slot);
 
-        if (was_keyboard) {
+        if (was_keyboard && s31_boot_usb_mode) {
+            memset(s31_boot_keys, 0, sizeof(s31_boot_keys));
+            s31_boot_modifiers = 0;
+            s31_boot_key_event = 0;
+        }
+
+        if (was_keyboard && !s31_boot_usb_mode) {
             hid_keyboard_report_t empty = {};
             processKeyboardReport(&empty, &dev->last_kb_report, true);
         }
@@ -1290,7 +1311,6 @@ private:
         if (ep_num >= MAX_ENDPOINTS) return;
 
         EndpointInfo *ep_info = &dev->endpoint_info[ep_num];
-
         // Boot keyboard: HID class, Boot subclass, Keyboard protocol
         if (ep_info->bInterfaceClass == USB_CLASS_HID &&
             ep_info->bInterfaceSubClass == HID_SUBCLASS_BOOT &&
@@ -1307,6 +1327,22 @@ private:
             report.keycode[4] = transfer->data_buffer[6];
             report.keycode[5] = transfer->data_buffer[7];
 
+            if (s31_boot_usb_mode) {
+                s31_boot_modifiers = report.modifier;
+                bool next[256] = {};
+                for (uint8_t key : report.keycode) if (key > 3) next[key] = true;
+                for (unsigned k = 4; k < 256; ++k)
+                    if (next[k] && !s31_boot_keys[k]) s31_boot_key_event = (uint8_t)k;
+                memcpy(s31_boot_keys, next, sizeof(next));
+                memcpy(&dev->last_kb_report, &report, sizeof(report));
+                return;
+            }
+            if (s31_boot_suppress_held) {
+                bool held = report.modifier != 0;
+                for (uint8_t key : report.keycode) held |= key != 0;
+                if (!held) s31_boot_suppress_held = false;
+                return;
+            }
             if (keyboard_enabled &&
                 memcmp(&report, &dev->last_kb_report, sizeof(report)) != 0) {
                 processKeyboardReport(&report, &dev->last_kb_report);
@@ -1319,6 +1355,33 @@ private:
         }
     }
 };
+
+bool S31BootUsbBegin() {
+    s31_boot_usb_mode = true;
+    memset(s31_boot_keys, 0, sizeof(s31_boot_keys));
+    s31_boot_key_event = 0;
+    usbHost = new MultiDeviceUsbHost();
+    if (!usbHost) return false;
+    if (!usbHost->begin()) { delete usbHost; usbHost = nullptr; return false; }
+    return true;
+}
+void S31BootUsbPoll() { if (usbHost) usbHost->task(); }
+bool S31BootUsbAnyKeyDown() {
+    if (s31_boot_modifiers) return true;
+    for (bool held : s31_boot_keys) if (held) return true;
+    return false;
+}
+uint8_t S31BootUsbTakeKey() { uint8_t k = s31_boot_key_event; s31_boot_key_event = 0; return k; }
+void S31BootUsbMouse(int *dx, int *dy, uint8_t *buttons) {
+    *dx = s31_mouse_dx; *dy = s31_mouse_dy; *buttons = s31_mouse_buttons;
+    s31_mouse_dx = s31_mouse_dy = 0;
+}
+void S31BootUsbFinish() {
+    s31_boot_usb_mode = false;
+    s31_boot_suppress_held = s31_boot_modifiers != 0;
+    for (bool held : s31_boot_keys) s31_boot_suppress_held |= held;
+    if (usbHost) for (auto &dev : usbHost->devices) memset(&dev.last_kb_report, 0, sizeof(dev.last_kb_report));
+}
 
 // ============================================================================
 // Touch Input Handling
@@ -1451,8 +1514,10 @@ bool InputInit(void)
     tab5_keyboard_connected = BoardKeyboard_IsConnected();
     
     Serial.println("[INPUT] Initializing USB Host (hub support enabled)...");
-    usbHost = new MultiDeviceUsbHost();
     if (usbHost != NULL) {
+        usb_keyboard_connected = usbHost->hasAnyKeyboard();
+        Serial.println("[INPUT] Reusing pre-boot USB Host");
+    } else if ((usbHost = new MultiDeviceUsbHost()) != NULL) {
         if (usbHost->begin()) {
             Serial.println("[INPUT] USB Host initialized - connect keyboard/mouse (hub supported)");
         } else {

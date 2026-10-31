@@ -1,0 +1,5 @@
+# Future browser flashing (not implemented)
+
+The current release provides a Windows x64 package, not a web installer. Espressif's [esptool-js](https://github.com/espressif/esptool-js) uses the Web Serial API in compatible Chromium-based browsers, and its current source includes an [ESP32-S31 target](https://github.com/espressif/esptool-js/blob/main/src/targets/index.ts). That is a possible starting point, not proof that this board, USB bridge, bootloader, resets, flash verification, or release images work in the browser.
+
+A future implementation should pin and audit a known esptool-js release; serve immutable release images over HTTPS; provide their SHA-256 checksums; display the board and the three documented offsets; require explicit port selection and confirmation; preserve NVS unless an erase is explicitly chosen; report failures and verification results; and test cold/warm reset, reconnect, supported browsers, and an actual ESP32-S31-Korvo-1 before advertising support. The page must not upload serial data or require Wi-Fi on the board. Publishing a web installer or site is not part of this release.

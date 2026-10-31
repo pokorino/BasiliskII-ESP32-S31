@@ -786,7 +786,7 @@ void REGPARAM2 fram24_bput(uaecptr addr, uae_u32 b)
 
 uae_u8 *REGPARAM2 default_xlate (uaecptr a)
 {
-    write_log("Your Mac program just did something terribly stupid\n");
+    write_log("[CPU] Unmapped memory translation: %08lx\n", (unsigned long)a);
     return NULL;
 }
 

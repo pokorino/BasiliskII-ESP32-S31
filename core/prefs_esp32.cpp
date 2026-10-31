@@ -8,6 +8,9 @@
 #include "prefs.h"
 #include "boot_gui.h"
 #include "board_config.h"
+#if !defined(BOARD_P4_MINI_43)
+#include "s31_settings.h"
+#endif
 #if defined(BOARD_P4_MINI_43)
 #include "p4_mini/board_rom.h"
 #endif
@@ -38,7 +41,11 @@ void LoadPrefs(const char *vmdir)
     const char *rom = BoardMini_ROMPath();
     PrefsReplaceString("rom", rom ? rom : "/Q650.ROM");
 #else
+#if S31_FLASH_BOOT
     PrefsReplaceString("rom", "/Q650.ROM");
+#else
+    PrefsReplaceString("rom", S31SettingsROM());
+#endif
 #endif
     
     // The small System 7.0 boot disk uses the classic Mac IIci model profile.

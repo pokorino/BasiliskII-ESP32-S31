@@ -121,6 +121,17 @@ static void selftest(void *) {
                                 0xf210, 0x7400};
     run(fractional); check("fpu-double-fraction-hi", get_long(0x30000), 0x3ffc0000);
     check("fpu-double-fraction-lo", get_long(0x30004), 0);
+    // A guest shutdown during a nested 68k call must unwind without running
+    // the instruction after the shutdown opcode, and remain requested.
+    reset();
+    put_word(0x20000, M68K_EMUL_OP_SHUTDOWN);
+    put_word(0x20002, 0x70ff); // MOVEQ #-1,D0 must not execute
+    put_word(0x20004, M68K_EXEC_RETURN);
+    M68kRegisters shutdown_regs = {};
+    shutdown_regs.d[0] = 42;
+    Execute68k(0x20000, &shutdown_regs);
+    check("shutdown-no-next-guest-instruction", shutdown_regs.d[0], 42);
+    check("shutdown-survives-nested-call", quit_program, 1);
     printf("CPU040 RESULT %s passed=%u failed=%u\n", failed ? "FAIL" : "PASS", passed, failed);
     printf("CPU040 DONE\n");
     fflush(stdout);

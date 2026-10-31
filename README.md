@@ -1,91 +1,76 @@
-# BasiliskII for ESP32-S31-Korvo-1
+# Basilisk II for ESP32-S31-Korvo-1
 
-**ESP32-S31 Emulator Preview**  
-Developed by pokorino LABO
+**Experimental, interpreter-only classic Macintosh emulator port.** Developed by pokorino LABO.
 
-公開初版はソースコードのプレビューです。PC用画面ビューアーと検証用Flash起動構成は含みません。
+This release is intended for the Espressif **ESP32-S31-Korvo-1** with the attached **800 × 480 RGB LCD and touch panel (GT1151 driver; controller reported GT1158)**, 16 MiB flash and 16 MiB PSRAM. It is based on Basilisk II and an ESP32-P4 port; see [credits and licenses](THIRD_PARTY.md).
 
-Experimental **interpreter-based (non-JIT)** port of BasiliskII to the
-ESP32-S31-Korvo-1 with an 800×480 RGB LCD, 16 MiB flash and 16 MiB PSRAM.
+## What has been tested
 
-**This published source preview has not been verified on physical hardware.**
-A later, unpublished development build has undergone initial testing on an
-ESP32-S31-Korvo-1; those results do not verify this exact source snapshot.
+The release binary was built from this source and flashed to the board with the packaged Windows tool. On that board, Mac OS 8.1 booted from a microSD disk image to the Finder with 12 MiB of emulated RAM. Touch input, opening the settings screen, changing RAM and saving the configuration were exercised; the settings text was reported readable. A predecessor build also exercised USB keyboard input, USB mouse movement and clicks, opening settings using Enter, and Mac OS shutdown. The release changes the user-interface font to DejaVu Sans for clear redistribution terms.
 
-## 実装した機能
+Audio codec initialization appeared in the log, but audible output was not tested. USB hubs, other displays, long-term stability, additional ROM/disk combinations, and selecting alternative ROMs/disks in the settings menu have not been verified. These observations are not a complete compatibility claim.
 
-- UAE 68040インタープリターとソフトウェアFPU。
-- 800×480表示、1/2/4/8-bitゲスト画面の変換。
-- microSD上のMacintosh ROM・ディスクイメージ読み込み。
-- GT1151タッチ、画面キーボード。
-- USB HIDキーボード・マウス、ハブ経由の接続処理。
-- ES8389音声出力処理。
+The application has no wireless configuration and does not deliberately start Wi-Fi, Bluetooth, or IEEE 802.15.4 radios. Some ESP-IDF dependencies include wireless-related components; this is not an RF certification or a radio-emission measurement.
 
-この公開ソースのタッチ・USB・音声は、実機での確認が未完了です。
-Wi-Fi、マイク、ExtFS、設定GUIはこのS31構成では接続していません。
-JIT実験版とLinuxプロジェクトは含みません。
+## Quick start: Windows x64
 
-## 検証状況
+[日本語の導入手順](docs/WINDOWS-JA.md)
 
-ローカルの別検証構成では、esp-emu v0.50.0上で68040 CPUテスト25項目に成功し、
-ROM/OSを内蔵Flashに配置した構成でSystem 7.0のFinder表示とキー入力を確認しました。
-それはエミュレーター上の別構成による結果です。この公開構成のmicroSD・LCD・USB・
-タッチ・音声が実機で動くことを証明したものではありません。
+1. Download `BasiliskII-S31-Windows.zip` from the [Releases page](https://github.com/pokorino/BasiliskII-ESP32-S31/releases) and extract the **entire** ZIP. It includes the official Espressif esptool, so Python and ESP-IDF are not required for flashing. Windows ARM and 32-bit Windows are not supported by this package.
+2. Connect the board's USB serial interface to the PC. If Windows does not show a COM port, install the correct USB-to-serial driver for the adapter; the tested setup enumerated as a Silicon Labs CP210x. The correct port may differ on another computer.
+3. Double-click `flash.cmd`, enter the board's `COM` port (for example `COM3`), and type `YES`. Wait for all hash checks and `Flash verified`. Do not disconnect power during flashing. The script restarts the board automatically.
+4. Prepare a FAT32 microSD card as described below. With power off, insert it and then power on the board. The screen remains black during the settings-shortcut window and while the Mac starts.
 
-### 後続の開発版における実機確認
+The script writes **bootloader.bin at 0x2000**, **partition-table.bin at 0x8000**, and **basiliskii-s31.bin at 0x10000**, using DIO, 80 MHz, 16 MB flash. It does not erase the entire flash or write the microSD card. It does replace the flash partition table; data in an existing flash layout may be inaccessible or overwritten. Existing NVS settings are not intentionally erased. Back up any important flash contents first.
 
-この公開初版とは異なる、後続の未公開開発版をESP32-S31-Korvo-1実機で試し、
-12 MiBのMac RAM、microSD上のROMとMac OS 8.1ディスクを使ってFinderを表示し、
-タッチおよびUSBマウスでの操作とMac OSの終了を確認しました。
-音声の初期化はログで確認しましたが、実際の音の再生は未確認です。
-これらは開発版での結果であり、このリポジトリの公開初版が同じ動作をすることを
-保証するものではありません。実機対応版は準備中です。
+The distribution also contains `esptool.exe`, `flash.ps1`, `flash.cmd`, `LICENSE-GPL-2.0.txt`, `THIRD_PARTY.txt`, and `SHA256SUMS.txt`. If the script cannot connect, check the selected COM port, the USB cable and driver, and the board's boot mode. Do not use the ROM or OS files from untrusted sources.
 
-この公開パッケージの既定構成は **microSD・非JIT** です。
-個人のROM、Mac OSイメージ、Flash起動用イメージ、検証ログは配布しません。
+## ROM and disk images: supplied by the user
 
-## ビルド
+No Macintosh ROM, Mac OS image, disk image or Apple software is included. Supply your own legally obtained compatible ROM and bootable classic Mac OS disk image. Back up the image: it is opened **read/write**, and the host disk code can update HFS volume metadata when it detects an unclean volume.
 
-ESP32-S31対応の **ESP-IDF 6.1** と、そのRISC-Vツールチェーンを用意し、
-ESP-IDFの環境を有効にして実行してください。
+For a fresh configuration, copy these files to the **root of the FAT32 microSD card**:
+
+| Filename | Contents |
+| --- | --- |
+| `MAC_ROM.dat` | Compatible Macintosh ROM |
+| `mac1.HFV` | Bootable Mac OS disk image |
+
+Existing saved settings can select different filenames. Settings scans only the card root: ROM extensions `.rom` and `.dat`; disk extensions `.hfv`, `.dsk`, and `.img` (case-insensitive). Up to 24 candidates of each kind are listed, including the current selection. The filename is not proof that a ROM or disk is compatible. Use disk images under 2 GiB; the backend uses 32-bit file offsets. Only one startup disk is selected by this UI.
+
+The ROM used in the developer's test was identified by their Windows Basilisk II as Performa 580/588 (`064DC91D` ROM checksum). The developer owns a Performa 588. A matching short checksum alone does not prove two ROM files are byte-identical. This build sets the emulator model ID to **14 (Quadra 900)** and CPU type to 68040; the configured model ID is not the physical model of the ROM donor. Compatibility with other ROMs and Mac OS versions is not assured.
+
+## Settings
+
+During the first five seconds after startup, hold a USB keyboard key or touch the screen for approximately 0.6 seconds to open the settings screen. Keep the key held until the menu appears. On the tested board, touching the screen **before** turning on the power switch did not register reliably; switch on first, wait briefly, then touch and hold. Otherwise the Mac boots automatically.
+
+Use touch or USB mouse on a row, or the keyboard arrows to select a row and change its value. `Enter` or `Space` changes the focused value; on **SAVE AND START** it saves and starts the Mac. The menu offers:
+
+- `MAC RAM`: 8, 10, 11 or 12 MiB. The fresh default is 12 MiB; previously saved NVS settings take precedence.
+- `SOUND`: on or off. Real sound output remains unverified.
+- `ROM FILE` and `STARTUP DISK`: cycle through eligible files in the microSD root.
+- `SAVE AND START`: check that both files exist, save settings to NVS, and start.
+
+Settings access by screen, RAM selection, saving, and the revised font were checked on the release build. The Enter shortcut was checked on the predecessor build; alternate-file booting remains unverified. If the card fails to mount at boot, the settings screen is not available.
+
+After Mac OS **Shut Down**, the application stops and the LCD becomes black. The S31 board remains powered; turn its power switch off or reset it to start again.
+
+## Build from source
+
+Use **ESP-IDF 6.1** and the dependencies pinned in `dependencies.lock`: Espressif `esp32_s31_korvo_1_noglib` 1.0.1 and Arduino-ESP32 4.0.0-rc1. The development environment used ESP-IDF commit `fff9895c82d744c7237be8847347bdd1b07c6643` and esptool 5.6.0. Other versions are not verified. Activate the ESP-IDF environment and run:
 
 ```sh
 idf.py set-target esp32s31
 idf.py build
-idf.py -p YOUR_SERIAL_PORT flash monitor
+idf.py -p COM3 flash monitor
 ```
 
-Component Managerが `main/idf_component.yml` の依存関係を取得します。
-主な固定依存は Korvo-1 BSP 1.0.1 と Arduino-ESP32 4.0.0-rc1 です。
-開発版SDK・コンポーネントを使用しているため、別リビジョンでのビルドは未検証です。
+Replace `COM3` with the board's actual port. ROM and disk images belong on the microSD card; the public build does not package them. Do not use the private flash-image validation configuration in this repository. Source builds can differ byte-for-byte from the prebuilt release due to toolchain and build metadata.
 
-## ROMとディスク
+## Browser flashing
 
-権利を確認したROMとOSディスクを利用者自身で用意し、microSDルートへ配置します。
+A browser installer is **not included or tested**. A possible future implementation is described in [docs/WEB-FLASHING.md](docs/WEB-FLASHING.md); use the Windows package for this release.
 
-| ファイル名 | 用途 |
-|---|---|
-| `Q650.ROM` | Macintosh ROM（公開初版が要求するファイル名） |
-| `Macintosh8.dsk` | 起動ディスク（読み書き） |
+## Credits and licensing
 
-`Q650.ROM` はこの公開初版の固定ファイル名であり、ROMの機種を示すものではありません。
-開発に使用したWindows版BasiliskIIでは、手元の `MAC_ROM.dat` がPerforma 580/588と
-識別され、ROMチェックサム `064DC91D` が表示されました。S31実機の起動ログにも
-同じチェックサムが含まれていますが、この値だけではファイル全体の一致は証明できません。
-開発者の所有する実機はPerforma 588です。
-
-この公開初版のMac RAMの既定値は8 MiB、エミュレーターのモデルIDは14
-（Quadra 900）です。これはソフトウェアのモデル設定であり、使用したROMの機種や
-開発者の所有するMacを示すものではありません。
-ROM・OSとの互換性は利用者の構成で確認が必要です。
-ディスクのファイルオフセットは32-bitのため、2 GiB未満を想定しています。
-重要なディスクのコピーを作って試してください。
-
-アプリの配置は `0x10000`。書き込みにはブートローダーとパーティションも必要なため、
-上記の `idf.py flash` を使用してください。
-
-## ライセンス・移植元
-
-BasiliskII/UAEのGPL-2.0-or-laterの通知と各ファイルの著作権表示を保持しています。
-ライセンス本文は [LICENSE](LICENSE)、移植元は [THIRD_PARTY.md](THIRD_PARTY.md) を参照。
-ESP-IDF・Arduino・BSP等の依存コンポーネントには、それぞれのライセンスが適用されます。
+Thanks to Christian Bauer and Basilisk II contributors; Bernd Schmidt and UAE contributors; and [amcchord/M5Tab-Macintosh](https://github.com/amcchord/M5Tab-Macintosh), the ESP32-P4 port used as a starting point. Source notices are preserved. See [LICENSE](LICENSE) and [THIRD_PARTY.md](THIRD_PARTY.md) for project, font, tool, and dependency licenses.
