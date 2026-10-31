@@ -8,8 +8,9 @@ Developed by pokorino LABO
 Experimental **interpreter-based (non-JIT)** port of BasiliskII to the
 ESP32-S31-Korvo-1 with an 800×480 RGB LCD, 16 MiB flash and 16 MiB PSRAM.
 
-**Physical hardware operation has not been verified.** This repository contains
-source code, not a claim of a completed or stable hardware product.
+**This published source preview has not been verified on physical hardware.**
+A later, unpublished development build has undergone initial testing on an
+ESP32-S31-Korvo-1; those results do not verify this exact source snapshot.
 
 ## 実装した機能
 
@@ -20,7 +21,7 @@ source code, not a claim of a completed or stable hardware product.
 - USB HIDキーボード・マウス、ハブ経由の接続処理。
 - ES8389音声出力処理。
 
-タッチ・USB・音声は実装済みですが、S31実機での確認は未完了です。
+この公開ソースのタッチ・USB・音声は、実機での確認が未完了です。
 Wi-Fi、マイク、ExtFS、設定GUIはこのS31構成では接続していません。
 JIT実験版とLinuxプロジェクトは含みません。
 
@@ -30,6 +31,15 @@ JIT実験版とLinuxプロジェクトは含みません。
 ROM/OSを内蔵Flashに配置した構成でSystem 7.0のFinder表示とキー入力を確認しました。
 それはエミュレーター上の別構成による結果です。この公開構成のmicroSD・LCD・USB・
 タッチ・音声が実機で動くことを証明したものではありません。
+
+### 後続の開発版における実機確認
+
+この公開初版とは異なる、後続の未公開開発版をESP32-S31-Korvo-1実機で試し、
+12 MiBのMac RAM、microSD上のROMとMac OS 8.1ディスクを使ってFinderを表示し、
+タッチおよびUSBマウスでの操作とMac OSの終了を確認しました。
+音声の初期化はログで確認しましたが、実際の音の再生は未確認です。
+これらは開発版での結果であり、このリポジトリの公開初版が同じ動作をすることを
+保証するものではありません。実機対応版は準備中です。
 
 この公開パッケージの既定構成は **microSD・非JIT** です。
 個人のROM、Mac OSイメージ、Flash起動用イメージ、検証ログは配布しません。
@@ -55,10 +65,18 @@ Component Managerが `main/idf_component.yml` の依存関係を取得します�
 
 | ファイル名 | 用途 |
 |---|---|
-| `Q650.ROM` | Macintosh ROM |
+| `Q650.ROM` | Macintosh ROM（公開初版が要求するファイル名） |
 | `Macintosh8.dsk` | 起動ディスク（読み書き） |
 
-Mac RAMの既定値は8 MiB、MacプロファイルはQuadra 900です。
+`Q650.ROM` はこの公開初版の固定ファイル名であり、ROMの機種を示すものではありません。
+開発に使用したWindows版BasiliskIIでは、手元の `MAC_ROM.dat` がPerforma 580/588と
+識別され、ROMチェックサム `064DC91D` が表示されました。S31実機の起動ログにも
+同じチェックサムが含まれていますが、この値だけではファイル全体の一致は証明できません。
+開発者の所有する実機はPerforma 588です。
+
+この公開初版のMac RAMの既定値は8 MiB、エミュレーターのモデルIDは14
+（Quadra 900）です。これはソフトウェアのモデル設定であり、使用したROMの機種や
+開発者の所有するMacを示すものではありません。
 ROM・OSとの互換性は利用者の構成で確認が必要です。
 ディスクのファイルオフセットは32-bitのため、2 GiB未満を想定しています。
 重要なディスクのコピーを作って試してください。
